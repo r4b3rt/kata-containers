@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use oci::Spec;
+use oci_spec::runtime::Spec;
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct CreateOpts {
     pub cgroup_name: String,
     pub use_systemd_cgroup: bool,
@@ -14,4 +14,5 @@ pub struct CreateOpts {
     pub spec: Option<Spec>,
     pub rootless_euid: bool,
     pub rootless_cgroup: bool,
+    pub container_name: String,
 }

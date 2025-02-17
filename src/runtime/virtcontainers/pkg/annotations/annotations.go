@@ -43,17 +43,15 @@ const (
 	// HypervisorPath is a sandbox annotation for passing a per container path pointing at the hypervisor that will run the container VM.
 	HypervisorPath = kataAnnotHypervisorPrefix + "path"
 
-	// HypervisorCtlPath is a sandbox annotation for passing a per container path pointing at the hypervisor control binary that will run the container VM.
-	HypervisorCtlPath = kataAnnotHypervisorPrefix + "ctlpath"
-
 	// JailerPath is a sandbox annotation for passing a per container path pointing at the jailer that will constrain the container VM.
 	JailerPath = kataAnnotHypervisorPrefix + "jailer_path"
 
-	// CtlPath is a sandbox annotation for passing a per container path pointing at the acrn ctl binary
-	CtlPath = kataAnnotHypervisorPrefix + "ctlpath"
-
 	// FirmwarePath is a sandbox annotation for passing a per container path pointing at the guest firmware that will run the container VM.
 	FirmwarePath = kataAnnotHypervisorPrefix + "firmware"
+
+	// FirmwareVolumePath is a sandbox annotation for passing a per container path pointing at the guest firmware volume
+	// that will be passed to the container VM.
+	FirmwareVolumePath = kataAnnotHypervisorPrefix + "firmware_volume"
 
 	// KernelHash is a sandbox annotation for passing a container kernel image SHA-512 hash value.
 	KernelHash = kataAnnotHypervisorPrefix + "kernel_hash"
@@ -67,20 +65,20 @@ const (
 	// HypervisorHash is an sandbox annotation for passing a container hypervisor binary SHA-512 hash value.
 	HypervisorHash = kataAnnotHypervisorPrefix + "hypervisor_hash"
 
-	// HypervisorCtlHash is a sandbox annotation for passing a container hypervisor control binary SHA-512 hash value.
-	HypervisorCtlHash = kataAnnotHypervisorPrefix + "hypervisorctl_hash"
-
 	// JailerHash is an sandbox annotation for passing a jailer binary SHA-512 hash value.
 	JailerHash = kataAnnotHypervisorPrefix + "jailer_hash"
 
 	// FirmwareHash is an sandbox annotation for passing a container guest firmware SHA-512 hash value.
 	FirmwareHash = kataAnnotHypervisorPrefix + "firmware_hash"
 
+	// FirmwareVolumeHash is an sandbox annotation for passing a container guest firmware volume SHA-512 hash value.
+	FirmwareVolumeHash = kataAnnotHypervisorPrefix + "firmware_volume_hash"
+
 	// AssetHashType is the hash type used for assets verification
 	AssetHashType = kataAnnotationsPrefix + "asset_hash_type"
 
 	//
-	//	Generic annotations
+	// Generic annotations
 	//
 
 	// KernelParams is a sandbox annotation for passing additional guest kernel parameters.
@@ -105,26 +103,43 @@ const (
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath = kataAnnotHypervisorPrefix + "vhost_user_store_path"
 
+	// VhostUserDeviceReconnect is a sandbox annotation to specify the timeout for reconnecting on
+	// non-server sockets when the remote end goes away.
+	VhostUserDeviceReconnect = kataAnnotHypervisorPrefix + "vhost_user_reconnect_timeout_sec"
+
 	// GuestHookPath is a sandbox annotation to specify the path within the VM that will be used for 'drop-in' hooks.
 	GuestHookPath = kataAnnotHypervisorPrefix + "guest_hook_path"
 
 	// DisableImageNvdimm is a sandbox annotation to specify use of nvdimm device for guest rootfs image.
 	DisableImageNvdimm = kataAnnotHypervisorPrefix + "disable_image_nvdimm"
 
-	// HotplugVFIOOnRootBus is a sandbox annotation used to indicate if devices need to be hotplugged on the
-	// root bus instead of a bridge.
-	HotplugVFIOOnRootBus = kataAnnotHypervisorPrefix + "hotplug_vfio_on_root_bus"
+	// ColdPlugVFIO is a sandbox annotation used to indicate if devices need to be coldplugged.
+	ColdPlugVFIO = kataAnnotHypervisorPrefix + "cold_plug_vfio"
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
+	// HotPlugVFIO is a sandbox annotation used to indicate if devices need to be hotplugged.
+	HotPlugVFIO = kataAnnotHypervisorPrefix + "hot_plug_vfio"
+
+	// PCIeRootPort is the number of PCIe root ports to create for the VM.
 	PCIeRootPort = kataAnnotHypervisorPrefix + "pcie_root_port"
+
+	// PCIeSwitchPort is the number of PCIe switch ports to create for the VM.
+	PCIeSwitchPort = kataAnnotHypervisorPrefix + "pcie_switch_port"
 
 	// EntropySource is a sandbox annotation to specify the path to a host source of
 	// entropy (/dev/random, /dev/urandom or real hardware RNG device)
 	EntropySource = kataAnnotHypervisorPrefix + "entropy_source"
 
+	// UseLegacySerial sets legacy serial device for guest console if available and implemented for architecture
+	UseLegacySerial = kataAnnotHypervisorPrefix + "use_legacy_serial"
+
+	// GPU specific annotations used by remote hypervisor for instance selection
+	// Number of GPUs required in the Kata VM
+	DefaultGPUs = kataAnnotHypervisorPrefix + "default_gpus"
+	// GPU model - tesla, h100, radeon etc..
+	DefaultGPUModel = kataAnnotHypervisorPrefix + "default_gpu_model"
+
 	//
-	//	CPU Annotations
+	// CPU Annotations
 	//
 
 	// DefaultVCPUs is a sandbox annotation for passing the default vcpus assigned for a VM by the hypervisor.
@@ -134,7 +149,7 @@ const (
 	DefaultMaxVCPUs = kataAnnotHypervisorPrefix + "default_max_vcpus"
 
 	//
-	//	Memory related annotations
+	// Memory related annotations
 	//
 
 	// DefaultMemory is a sandbox annotation for the memory assigned for a VM by the hypervisor.
@@ -152,10 +167,6 @@ const (
 	// MemPrealloc is a sandbox annotation that specifies the memory space used for nvdimm device by the hypervisor.
 	MemPrealloc = kataAnnotHypervisorPrefix + "enable_mem_prealloc"
 
-	// EnableSwap is a sandbox annotation to enable swap of vm memory.
-	// The behaviour is undefined if mem_prealloc is also set to true
-	EnableSwap = kataAnnotHypervisorPrefix + "enable_swap"
-
 	// HugePages is a sandbox annotation to specify if the memory should be pre-allocated from huge pages
 	HugePages = kataAnnotHypervisorPrefix + "enable_hugepages"
 
@@ -169,7 +180,7 @@ const (
 	FileBackedMemRootDir = kataAnnotHypervisorPrefix + "file_mem_backend"
 
 	//
-	//	Shared File System related annotations
+	// Shared File System related annotations
 	//
 
 	// Msize9p is a sandbox annotation to specify as the msize for 9p shares
@@ -181,7 +192,7 @@ const (
 	// VirtioFSDaemon is a sandbox annotations to specify virtio-fs vhost-user daemon path
 	VirtioFSDaemon = kataAnnotHypervisorPrefix + "virtio_fs_daemon"
 
-	// VirtioFSCache is a sandbox annotation to specify the cache mode for fs version cache or "none"
+	// VirtioFSCache is a sandbox annotation to specify the cache mode for fs version cache
 	VirtioFSCache = kataAnnotHypervisorPrefix + "virtio_fs_cache"
 
 	// VirtioFSCacheSize is a sandbox annotation to specify the DAX cache size in MiB
@@ -191,11 +202,14 @@ const (
 	VirtioFSExtraArgs = kataAnnotHypervisorPrefix + "virtio_fs_extra_args"
 
 	//
-	//	Block Device related annotations
+	// Block Device related annotations
 	//
 
 	// BlockDeviceDriver specifies the driver to be used for block device either VirtioSCSI or VirtioBlock
 	BlockDeviceDriver = kataAnnotHypervisorPrefix + "block_device_driver"
+
+	// BlockDeviceAIO specifies I/O mechanism to be used with VirtioBlock for qemu
+	BlockDeviceAIO = kataAnnotHypervisorPrefix + "block_device_aio"
 
 	// DisableBlockDeviceUse  is a sandbox annotation that disallows a block device from being used.
 	DisableBlockDeviceUse = kataAnnotHypervisorPrefix + "disable_block_device_use"
@@ -223,6 +237,12 @@ const (
 
 	// EnableGuestSwap is a sandbox annotation to enable swap in the guest.
 	EnableGuestSwap = kataAnnotHypervisorPrefix + "enable_guest_swap"
+
+	// EnableRootlessHypervisor is a sandbox annotation to enable rootless hypervisor (only supported in QEMU currently).
+	EnableRootlessHypervisor = kataAnnotHypervisorPrefix + "rootless"
+
+	// Initdata is the initdata passed in when CreateVM
+	Initdata = kataConfAnnotationsPrefix + "runtime.cc_init_data"
 )
 
 // Runtime related annotations
@@ -232,8 +252,14 @@ const (
 	// DisableGuestSeccomp is a sandbox annotation that determines if seccomp should be applied inside guest.
 	DisableGuestSeccomp = kataAnnotRuntimePrefix + "disable_guest_seccomp"
 
+	// GuestSeLinuxLabel is a SELinux security policy that is applied to a container process inside guest.
+	GuestSeLinuxLabel = kataAnnotRuntimePrefix + "guest_selinux_label"
+
 	// SandboxCgroupOnly is a sandbox annotation that determines if kata processes are managed only in sandbox cgroup.
 	SandboxCgroupOnly = kataAnnotRuntimePrefix + "sandbox_cgroup_only"
+
+	// EnableVCPUsPinning is a sandbox annotation that controls bundling between vCPU threads and CPUs
+	EnableVCPUsPinning = kataAnnotationsPrefix + "enable_vcpus_pinning"
 
 	// EnablePprof is a sandbox annotation that determines if pprof enabled.
 	EnablePprof = kataAnnotRuntimePrefix + "enable_pprof"
@@ -247,6 +273,13 @@ const (
 
 	// DisableNewNetNs is a sandbox annotation that determines if create a netns for hypervisor process.
 	DisableNewNetNs = kataAnnotRuntimePrefix + "disable_new_netns"
+
+	// VfioMode is a sandbox annotation to specify how attached VFIO devices should be treated
+	// Overrides the runtime.vfio_mode parameter in the global configuration.toml
+	VfioMode = kataAnnotRuntimePrefix + "vfio_mode"
+
+	// CreateContainerTimeout is a sandbox annotaion that sets the create container timeout.
+	CreateContainerTimeout = kataAnnotRuntimePrefix + "create_container_timeout"
 )
 
 // Agent related annotations
@@ -269,16 +302,15 @@ const (
 	// AgentTrace is a sandbox annotation to enable tracing for the agent.
 	AgentTrace = kataAnnotAgentPrefix + "enable_tracing"
 
-	// AgentTraceMode is a sandbox annotation to specify the trace mode for the agent.
-	AgentTraceMode = kataAnnotAgentPrefix + "trace_mode"
-
-	// AgentTraceMode is a sandbox annotation to specify the trace type for the agent.
-	AgentTraceType = kataAnnotAgentPrefix + "trace_type"
-
 	// AgentContainerPipeSize is an annotation to specify the size of the pipes created for containers
 	AgentContainerPipeSize       = kataAnnotAgentPrefix + ContainerPipeSizeOption
 	ContainerPipeSizeOption      = "container_pipe_size"
 	ContainerPipeSizeKernelParam = "agent." + ContainerPipeSizeOption
+	CdhApiTimeoutOption          = "cdh_api_timeout"
+	CdhApiTimeoutKernelParam     = "agent." + CdhApiTimeoutOption
+
+	// Policy is an annotation containing the contents of an agent policy file, base64 encoded.
+	Policy = kataAnnotAgentPrefix + "policy"
 )
 
 // Container resource related annotations
@@ -290,6 +322,21 @@ const (
 
 	// ContainerResourcesSwapInBytes is a container annotation to specify the Resources.Memory.Swap
 	ContainerResourcesSwapInBytes = kataAnnotContainerResourcePrefix + "swap_in_bytes"
+)
+
+// Annotations related to file system options.
+const (
+	kataAnnotFsOptPrefix = kataAnnotationsPrefix + "fs-opt."
+
+	// FileSystemLayer describes a layer of an overlay filesystem.
+	FileSystemLayer = kataAnnotFsOptPrefix + "layer="
+
+	// IsFileSystemLayer indicates that the annotated filesystem is a layer of an overlay fs.
+	IsFileSystemLayer = kataAnnotFsOptPrefix + "is-layer"
+
+	// IsFileBlockDevice indicates that the annotated filesystem is mounted on a block device
+	// backed by a host file.
+	IsFileBlockDevice = kataAnnotFsOptPrefix + "block_device=file"
 )
 
 const (

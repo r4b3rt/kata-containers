@@ -7,13 +7,11 @@ package katamonitor
 
 import (
 	"fmt"
-	"io/ioutil"
-	"net"
 	"net/http"
+	"strings"
 	"time"
 
-	cdshim "github.com/containerd/containerd/runtime/v2/shim"
-	shim "github.com/kata-containers/kata-containers/src/runtime/containerd-shim-v2"
+	shim "github.com/kata-containers/kata-containers/src/runtime/pkg/containerd-shim-v2"
 )
 
 const (
@@ -36,50 +34,14 @@ func getSandboxIDFromReq(r *http.Request) (string, error) {
 	return "", fmt.Errorf("sandbox not found in %+v", r.URL.Query())
 }
 
-// BuildShimClient builds and returns an http client for communicating with the provided sandbox
-func BuildShimClient(sandboxID string, timeout time.Duration) (*http.Client, error) {
-	return buildUnixSocketClient(shim.SocketAddress(sandboxID), timeout)
+func getSandboxFS() string {
+	return shim.GetSandboxesStoragePath()
 }
 
-// buildUnixSocketClient build http client for Unix socket
-func buildUnixSocketClient(socketAddr string, timeout time.Duration) (*http.Client, error) {
-	transport := &http.Transport{
-		DisableKeepAlives: true,
-		Dial: func(proto, addr string) (conn net.Conn, err error) {
-			return cdshim.AnonDialer(socketAddr, timeout)
-		},
+func getFilterFamilyFromReq(r *http.Request) ([]string, error) {
+	filterFamilies := r.URL.Query().Get("filter_family")
+	if filterFamilies != "" {
+		return strings.Split(filterFamilies, ","), nil
 	}
-
-	client := &http.Client{
-		Transport: transport,
-	}
-
-	if timeout > 0 {
-		client.Timeout = timeout
-	}
-
-	return client, nil
-}
-
-func doGet(sandboxID string, timeoutInSeconds time.Duration, urlPath string) ([]byte, error) {
-	client, err := BuildShimClient(sandboxID, timeoutInSeconds)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := client.Get(fmt.Sprintf("http://shim/%s", urlPath))
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		resp.Body.Close()
-	}()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	return body, nil
+	return nil, nil
 }

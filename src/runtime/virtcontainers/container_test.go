@@ -7,20 +7,15 @@ package virtcontainers
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 
-	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -87,7 +82,7 @@ func TestContainerRemoveDrive(t *testing.T) {
 	sandbox := &Sandbox{
 		ctx:        context.Background(),
 		id:         "sandbox",
-		devManager: manager.NewDeviceManager(manager.VirtioSCSI, false, "", nil),
+		devManager: manager.NewDeviceManager(config.VirtioSCSI, false, "", 0, nil),
 		config:     &SandboxConfig{},
 	}
 
@@ -99,7 +94,7 @@ func TestContainerRemoveDrive(t *testing.T) {
 	container.state.Fstype = ""
 	err := container.removeDrive(sandbox.ctx)
 
-	// hotplugRemoveDevice for hypervisor should not be called.
+	// HotplugRemoveDevice for hypervisor should not be called.
 	// test should pass without a hypervisor created for the container's sandbox.
 	assert.Nil(t, err, "remove drive should succeed")
 
@@ -123,272 +118,6 @@ func TestContainerRemoveDrive(t *testing.T) {
 	container.state.BlockDeviceID = device.DeviceID()
 	err = container.removeDrive(sandbox.ctx)
 	assert.Nil(t, err, "remove drive should succeed")
-}
-
-func TestUnmountHostMountsRemoveBindHostPath(t *testing.T) {
-	if tc.NotValid(ktu.NeedRoot()) {
-		t.Skip(testDisabledAsNonRoot)
-	}
-
-	createFakeMountDir := func(t *testing.T, dir, prefix string) string {
-		name, err := ioutil.TempDir(dir, "test-mnt-"+prefix+"-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return name
-	}
-
-	createFakeMountFile := func(t *testing.T, dir, prefix string) string {
-		f, err := ioutil.TempFile(dir, "test-mnt-"+prefix+"-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		f.Close()
-		return f.Name()
-	}
-
-	doUnmountCheck := func(src, dest, hostPath, nonEmptyHostpath, devPath string) {
-		mounts := []Mount{
-			{
-				Source:      src,
-				Destination: dest,
-				HostPath:    hostPath,
-				Type:        "bind",
-			},
-			{
-				Source:      src,
-				Destination: dest,
-				HostPath:    nonEmptyHostpath,
-				Type:        "bind",
-			},
-			{
-				Source:      src,
-				Destination: dest,
-				HostPath:    devPath,
-				Type:        "dev",
-			},
-		}
-
-		c := Container{
-			mounts: mounts,
-			ctx:    context.Background(),
-		}
-
-		if err := bindMount(c.ctx, src, hostPath, false, "private"); err != nil {
-			t.Fatal(err)
-		}
-		defer syscall.Unmount(hostPath, 0)
-		if err := bindMount(c.ctx, src, nonEmptyHostpath, false, "private"); err != nil {
-			t.Fatal(err)
-		}
-		defer syscall.Unmount(nonEmptyHostpath, 0)
-		if err := bindMount(c.ctx, src, devPath, false, "private"); err != nil {
-			t.Fatal(err)
-		}
-		defer syscall.Unmount(devPath, 0)
-
-		err := c.unmountHostMounts(c.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, path := range [3]string{src, dest, devPath} {
-			if _, err := os.Stat(path); err != nil {
-				if os.IsNotExist(err) {
-					t.Fatalf("path %s should not be removed", path)
-				} else {
-					t.Fatal(err)
-				}
-			}
-		}
-
-		if _, err := os.Stat(hostPath); err == nil {
-			t.Fatal("empty host-path should be removed")
-		} else if !os.IsNotExist(err) {
-			t.Fatal(err)
-		}
-
-		if _, err := os.Stat(nonEmptyHostpath); err != nil {
-			if os.IsNotExist(err) {
-				t.Fatal("non-empty host-path should not be removed")
-			} else {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	src := createFakeMountDir(t, testDir, "src")
-	dest := createFakeMountDir(t, testDir, "dest")
-	hostPath := createFakeMountDir(t, testDir, "host-path")
-	nonEmptyHostpath := createFakeMountDir(t, testDir, "non-empty-host-path")
-	devPath := createFakeMountDir(t, testDir, "dev-hostpath")
-	createFakeMountDir(t, nonEmptyHostpath, "nop")
-	doUnmountCheck(src, dest, hostPath, nonEmptyHostpath, devPath)
-
-	src = createFakeMountFile(t, testDir, "src")
-	dest = createFakeMountFile(t, testDir, "dest")
-	hostPath = createFakeMountFile(t, testDir, "host-path")
-	nonEmptyHostpath = createFakeMountFile(t, testDir, "non-empty-host-path")
-	devPath = createFakeMountFile(t, testDir, "dev-host-path")
-	f, err := os.OpenFile(nonEmptyHostpath, os.O_WRONLY, os.FileMode(0640))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.WriteString("nop\n")
-	f.Close()
-	doUnmountCheck(src, dest, hostPath, nonEmptyHostpath, devPath)
-}
-
-func testSetupFakeRootfs(t *testing.T) (testRawFile, loopDev, mntDir string, err error) {
-	assert := assert.New(t)
-	if tc.NotValid(ktu.NeedRoot()) {
-		t.Skip(testDisabledAsNonRoot)
-	}
-
-	tmpDir, err := ioutil.TempDir("", "")
-	assert.NoError(err)
-
-	testRawFile = filepath.Join(tmpDir, "raw.img")
-	_, err = os.Stat(testRawFile)
-	assert.True(os.IsNotExist(err))
-
-	output, err := exec.Command("losetup", "-f").CombinedOutput()
-	assert.NoError(err)
-	loopDev = strings.TrimSpace(string(output[:]))
-
-	_, err = exec.Command("fallocate", "-l", "256K", testRawFile).CombinedOutput()
-	assert.NoError(err)
-
-	_, err = exec.Command("mkfs.ext4", "-F", testRawFile).CombinedOutput()
-	assert.NoError(err)
-
-	_, err = exec.Command("losetup", loopDev, testRawFile).CombinedOutput()
-	assert.NoError(err)
-
-	mntDir = filepath.Join(tmpDir, "rootfs")
-	err = os.Mkdir(mntDir, DirMode)
-	assert.NoError(err)
-
-	err = syscall.Mount(loopDev, mntDir, "ext4", uintptr(0), "")
-	assert.NoError(err)
-	return
-}
-
-func cleanupFakeRootfsSetup(testRawFile, loopDev, mntDir string) {
-	// unmount loop device
-	if mntDir != "" {
-		syscall.Unmount(mntDir, 0)
-	}
-
-	// detach loop device
-	if loopDev != "" {
-		exec.Command("losetup", "-d", loopDev).CombinedOutput()
-	}
-
-	if _, err := os.Stat(testRawFile); err == nil {
-		tmpDir := filepath.Dir(testRawFile)
-		os.RemoveAll(tmpDir)
-	}
-}
-
-func TestContainerAddDriveDir(t *testing.T) {
-	assert := assert.New(t)
-	if tc.NotValid(ktu.NeedRoot()) {
-		t.Skip(testDisabledAsNonRoot)
-	}
-
-	testRawFile, loopDev, fakeRootfs, err := testSetupFakeRootfs(t)
-
-	defer cleanupFakeRootfsSetup(testRawFile, loopDev, fakeRootfs)
-
-	assert.NoError(err)
-
-	sandbox := &Sandbox{
-		ctx:        context.Background(),
-		id:         testSandboxID,
-		devManager: manager.NewDeviceManager(manager.VirtioSCSI, false, "", nil),
-		hypervisor: &mockHypervisor{},
-		agent:      &mockAgent{},
-		config: &SandboxConfig{
-			HypervisorConfig: HypervisorConfig{
-				DisableBlockDeviceUse: false,
-			},
-		},
-	}
-
-	sandbox.store, err = persist.GetDriver()
-	assert.NoError(err)
-	assert.NotNil(sandbox.store)
-
-	defer sandbox.store.Destroy(sandbox.id)
-
-	contID := "100"
-	container := Container{
-		sandbox: sandbox,
-		id:      contID,
-		rootFs:  RootFs{Target: fakeRootfs, Mounted: true},
-	}
-
-	// Make the checkStorageDriver func variable point to a fake check function
-	savedFunc := checkStorageDriver
-	checkStorageDriver = func(major, minor int) (bool, error) {
-		return true, nil
-	}
-
-	defer func() {
-		checkStorageDriver = savedFunc
-	}()
-
-	container.state.Fstype = ""
-
-	err = container.hotplugDrive(sandbox.ctx)
-	assert.NoError(err)
-
-	assert.NotEmpty(container.state.Fstype)
-}
-
-func TestContainerRootfsPath(t *testing.T) {
-
-	testRawFile, loopDev, fakeRootfs, err := testSetupFakeRootfs(t)
-	defer cleanupFakeRootfsSetup(testRawFile, loopDev, fakeRootfs)
-	assert.Nil(t, err)
-
-	truecheckstoragedriver := checkStorageDriver
-	checkStorageDriver = func(major, minor int) (bool, error) {
-		return true, nil
-	}
-	defer func() {
-		checkStorageDriver = truecheckstoragedriver
-	}()
-
-	sandbox := &Sandbox{
-		ctx:        context.Background(),
-		id:         "rootfstestsandbox",
-		agent:      &mockAgent{},
-		hypervisor: &mockHypervisor{},
-		config: &SandboxConfig{
-			HypervisorConfig: HypervisorConfig{
-				DisableBlockDeviceUse: false,
-			},
-		},
-	}
-
-	container := Container{
-		id:           "rootfstestcontainerid",
-		sandbox:      sandbox,
-		rootFs:       RootFs{Target: fakeRootfs, Mounted: true},
-		rootfsSuffix: "rootfs",
-	}
-
-	container.hotplugDrive(sandbox.ctx)
-	assert.Empty(t, container.rootfsSuffix)
-
-	// Reset the value to test the other case
-	container.rootFs = RootFs{Target: fakeRootfs + "/rootfs", Mounted: true}
-	container.rootfsSuffix = "rootfs"
-
-	container.hotplugDrive(sandbox.ctx)
-	assert.Equal(t, container.rootfsSuffix, "rootfs")
 }
 
 func TestCheckSandboxRunningEmptyCmdFailure(t *testing.T) {
@@ -556,14 +285,9 @@ func TestMountSharedDirMounts(t *testing.T) {
 
 	assert := assert.New(t)
 
-	testMountPath, err := ioutil.TempDir("", "sandbox-test")
-	assert.NoError(err)
-	defer os.RemoveAll(testMountPath)
-
 	// create a new shared directory for our test:
 	kataHostSharedDirSaved := kataHostSharedDir
-	testHostDir, err := ioutil.TempDir("", "kata-cleanup")
-	assert.NoError(err)
+	testHostDir := t.TempDir()
 	kataHostSharedDir = func() string {
 		return testHostDir
 	}
@@ -578,6 +302,7 @@ func TestMountSharedDirMounts(t *testing.T) {
 	sandbox := &Sandbox{
 		ctx:        context.Background(),
 		id:         "foobar",
+		agent:      newMockAgent(),
 		hypervisor: &mockHypervisor{},
 		config: &SandboxConfig{
 			HypervisorConfig: HypervisorConfig{
@@ -585,18 +310,30 @@ func TestMountSharedDirMounts(t *testing.T) {
 			},
 		},
 	}
+
+	fsShare, err := NewFilesystemShare(sandbox)
+	assert.Nil(err)
+	sandbox.fsShare = fsShare
+
 	// setup the shared mounts:
-	k.setupSharedPath(k.ctx, sandbox)
+	err = sandbox.fsShare.Prepare(sandbox.ctx)
+	assert.NoError(err)
 
 	//
 	// Create the mounts that we'll test with
 	//
+	testMountPath := t.TempDir()
 	secretpath := filepath.Join(testMountPath, K8sSecret)
 	err = os.MkdirAll(secretpath, 0777)
 	assert.NoError(err)
 	secret := filepath.Join(secretpath, "super-secret-thing")
-	_, err = os.Create(secret)
+	f, err := os.Create(secret)
 	assert.NoError(err)
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Fatalf("failed to close file: %v", err)
+		}
+	})
 
 	mountDestination := "/fluffhead/token"
 	//
@@ -635,4 +372,64 @@ func TestMountSharedDirMounts(t *testing.T) {
 	assert.Equal(len(updatedMounts), 1)
 	assert.Equal(updatedMounts[mountDestination].Source, expectedStorageDest)
 	assert.Equal(updatedMounts[mountDestination].Destination, mountDestination)
+
+	// Perform cleanups
+	err = container.unmountHostMounts(k.ctx)
+	assert.NoError(err)
+
+	err = fsShare.Cleanup(k.ctx)
+	assert.NoError(err)
+}
+
+func TestGetContainerId(t *testing.T) {
+	containerIDs := []string{"abc", "foobar", "123"}
+	containers := [3]*Container{}
+
+	for i, id := range containerIDs {
+		c := &Container{id: id}
+		containers[i] = c
+	}
+
+	for id, container := range containers {
+		assert.Equal(t, containerIDs[id], container.ID())
+	}
+}
+
+func TestContainerProcess(t *testing.T) {
+	assert := assert.New(t)
+
+	expectedProcess := Process{
+		Token: "foobar",
+		Pid:   123,
+	}
+	container := &Container{
+		process: expectedProcess,
+	}
+
+	process := container.Process()
+	assert.Exactly(process, expectedProcess)
+
+	token := container.GetToken()
+	assert.Exactly(token, "foobar")
+
+	pid := container.GetPid()
+	assert.Exactly(pid, 123)
+}
+
+func TestConfigValid(t *testing.T) {
+	assert := assert.New(t)
+
+	//no config
+	config := ContainerConfig{}
+	result := config.valid()
+	assert.False(result)
+
+	//no container ID
+	config = newTestContainerConfigNoop("")
+	result = config.valid()
+	assert.False(result)
+
+	config = newTestContainerConfigNoop("foobar")
+	result = config.valid()
+	assert.True(result)
 }

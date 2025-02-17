@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -8,16 +10,15 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/pkg/errors"
@@ -116,9 +117,17 @@ func TestQemuArchBaseKernelParameters(t *testing.T) {
 func TestQemuArchBaseCapabilities(t *testing.T) {
 	assert := assert.New(t)
 	qemuArchBase := newQemuArchBase()
+	hConfig := HypervisorConfig{}
+	hConfig.SharedFS = config.VirtioFS
 
-	c := qemuArchBase.capabilities()
+	c := qemuArchBase.capabilities(hConfig)
 	assert.True(c.IsBlockDeviceHotplugSupported())
+	assert.True(c.IsFsSharingSupported())
+	assert.True(c.IsNetworkDeviceHotplugSupported())
+
+	hConfig.SharedFS = config.NoSharedFS
+	c = qemuArchBase.capabilities(hConfig)
+	assert.False(c.IsFsSharingSupported())
 }
 
 func TestQemuArchBaseBridges(t *testing.T) {
@@ -158,7 +167,7 @@ func TestQemuAddDeviceToBridge(t *testing.T) {
 
 	// addDeviceToBridge fails cause q.Bridges == 0
 	q = newQemuArchBase()
-	q.qemuMachine.Type = QemuPCLite
+	q.qemuMachine.Type = QemuQ35
 	q.bridges(0)
 	_, _, err = q.addDeviceToBridge(context.Background(), "qemu-bridge", types.PCI)
 	if assert.Error(err) {
@@ -174,13 +183,13 @@ func TestQemuArchBaseCPUTopology(t *testing.T) {
 
 	expectedSMP := govmmQemu.SMP{
 		CPUs:    vcpus,
-		Sockets: defaultMaxQemuVCPUs,
+		Sockets: defaultMaxVCPUs,
 		Cores:   defaultCores,
 		Threads: defaultThreads,
-		MaxCPUs: defaultMaxQemuVCPUs,
+		MaxCPUs: defaultMaxVCPUs,
 	}
 
-	smp := qemuArchBase.cpuTopology(vcpus, defaultMaxQemuVCPUs)
+	smp := qemuArchBase.cpuTopology(vcpus, defaultMaxVCPUs)
 	assert.Equal(expectedSMP, smp)
 }
 
@@ -257,6 +266,36 @@ func TestQemuArchBaseAppendConsoles(t *testing.T) {
 	devices, err = qemuArchBase.appendConsole(context.Background(), devices, path)
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "hvc0"})
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "hvc1"})
+}
+
+func TestQemuArchBaseAppendConsolesLegacy(t *testing.T) {
+	var devices []govmmQemu.Device
+	var err error
+	assert := assert.New(t)
+	qemuArchBase := newQemuArchBase()
+	qemuArchBase.legacySerial = true
+
+	path := filepath.Join(filepath.Join(fs.MockRunStoragePath(), "test"), consoleSocket)
+
+	expectedOut := []govmmQemu.Device{
+		govmmQemu.LegacySerialDevice{
+			Chardev: "charconsole0",
+		},
+		govmmQemu.CharDevice{
+			Driver:   govmmQemu.LegacySerial,
+			Backend:  govmmQemu.Socket,
+			DeviceID: "console0",
+			ID:       "charconsole0",
+			Path:     path,
+		},
+	}
+
+	devices, err = qemuArchBase.appendConsole(context.Background(), devices, path)
+	assert.NoError(err)
+	assert.Equal(expectedOut, devices)
+	assert.Contains(qemuArchBase.kernelParams, Param{"console", "ttyS0"})
 }
 
 func TestQemuArchBaseAppendImage(t *testing.T) {
@@ -264,7 +303,7 @@ func TestQemuArchBaseAppendImage(t *testing.T) {
 	assert := assert.New(t)
 	qemuArchBase := newQemuArchBase()
 
-	image, err := ioutil.TempFile("", "img")
+	image, err := os.CreateTemp("", "img")
 	assert.NoError(err)
 	defer os.Remove(image.Name())
 	err = image.Close()
@@ -307,12 +346,15 @@ func TestQemuArchBaseAppendBridges(t *testing.T) {
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.BridgeDevice{
-			Type:    govmmQemu.PCIBridge,
-			Bus:     defaultBridgeBus,
-			ID:      bridges[0].ID,
-			Chassis: 1,
-			SHPC:    true,
-			Addr:    "2",
+			Type:          govmmQemu.PCIBridge,
+			Bus:           defaultBridgeBus,
+			ID:            bridges[0].ID,
+			Chassis:       1,
+			SHPC:          false,
+			Addr:          "2",
+			IOReserve:     "4k",
+			MemReserve:    "1m",
+			Pref64Reserve: "1m",
 		},
 	}
 
@@ -487,7 +529,7 @@ func TestQemuArchBaseAppendNetwork(t *testing.T) {
 
 	macAddr := net.HardwareAddr{0x02, 0x00, 0xCA, 0xFE, 0x00, 0x04}
 
-	macvlanEp := &BridgedMacvlanEndpoint{
+	macvlanEp := &MacvlanEndpoint{
 		NetPair: NetworkInterfacePair{
 			TapInterface: TapInterface{
 				ID:   "uniqueTestID-4",
@@ -502,7 +544,7 @@ func TestQemuArchBaseAppendNetwork(t *testing.T) {
 			},
 			NetInterworkingModel: DefaultNetInterworkingModel,
 		},
-		EndpointType: BridgedMacvlanEndpointType,
+		EndpointType: MacvlanEndpointType,
 	}
 
 	macvtapEp := &MacvtapEndpoint{

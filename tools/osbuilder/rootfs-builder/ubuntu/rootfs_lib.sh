@@ -1,87 +1,77 @@
-# - Arguments
-#
-# Copyright (c) 2018  Yash Jain
+# Copyright (c) 2018 Yash Jain, 2022 IBM Corp.
 #
 # SPDX-License-Identifier: Apache-2.0
-#
-#
-# rootfs_dir=$1
-#
-# - Optional environment variables
-#
-# EXTRA_PKGS: Variable to add extra PKGS provided by the user
-#
-# BIN_AGENT: Name of the Kata-Agent binary
-#
-# REPO_URL: URL to distribution repository ( should be configured in
-#			config.sh file)
-#
-# Any other configuration variable for a specific distro must be added
-# and documented on its own config.sh
-#
-# - Expected result
-#
-# rootfs_dir populated with rootfs pkgs
-# It must provide a binary in /sbin/init
-#
+
+build_dbus() {
+	local rootfs_dir=$1
+	ln -sf /lib/systemd/system/dbus.service $rootfs_dir/etc/systemd/system/dbus.service
+	ln -sf /lib/systemd/system/dbus.socket $rootfs_dir/etc/systemd/system/dbus.socket
+}
+
 build_rootfs() {
-	# Mandatory
-	local ROOTFS_DIR=$1
+	local rootfs_dir=$1
+	local multistrap_conf=multistrap.conf
 
-	# Name of the Kata-Agent binary
-	local BIN_AGENT=${BIN_AGENT}
+	# For simplicity's sake, use multistrap for foreign and native bootstraps.
+	cat > "$multistrap_conf" << EOF
+[General]
+cleanup=true
+aptsources=Ubuntu
+bootstrap=Ubuntu
 
-	# In case of support EXTRA packages, use it to allow
-	# users to add more packages to the base rootfs
-	local EXTRA_PKGS=${EXTRA_PKGS:-}
+[Ubuntu]
+source=$REPO_URL
+keyring=ubuntu-keyring
+suite=$OS_VERSION
+packages=$PACKAGES $EXTRA_PKGS
+EOF
 
-	# In case rootfs is created using repositories allow user to modify
-	# the default URL
-	local REPO_URL=${REPO_URL:-YOUR_REPO}
+	if [ "${CONFIDENTIAL_GUEST}" == "yes" ] && [ "${DEB_ARCH}" == "amd64" ]; then
+		mkdir -p $rootfs_dir/etc/apt/trusted.gpg.d/
+		curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key |
+			gpg --dearmour -o $rootfs_dir/etc/apt/trusted.gpg.d/intel-sgx-deb.gpg
+		sed -i -e "s/bootstrap=Ubuntu/bootstrap=Ubuntu intel-sgx/" $multistrap_conf
+		SUITE=$OS_VERSION
+		# Intel does not release sgx stuff for non-LTS, thus if using oracular (24.10),
+		# we need to enforce getting libtdx-attest from noble.
+		[ "$SUITE" = "oracular" ] && SUITE="noble"
+		cat >> $multistrap_conf << EOF
 
-	# PATH where files this script is placed
-	# Use it to refer to files in the same directory
-	# Example: ${CONFIG_DIR}/foo
-	local CONFIG_DIR=${CONFIG_DIR}
-
-
-	# Populate ROOTFS_DIR
-	# Must provide /sbin/init and /bin/${BIN_AGENT}
-	DEBOOTSTRAP="debootstrap"
-	check_root
-	mkdir -p "${ROOTFS_DIR}"
-	if [ -n "${PKG_MANAGER}"  ]; then
-		info "debootstrap path provided by user: ${PKG_MANAGER}"
-	elif check_program $DEBOOTSTRAP ; then
-		PKG_MANAGER=$DEBOOTSTRAP
-	else
-		die "$DEBOOTSTRAP is not installed"
-	fi
-	# trim whitespace
-	PACKAGES=$(echo $PACKAGES |xargs )
-	EXTRA_PKGS=$(echo $EXTRA_PKGS |xargs)
-	# add comma as debootstrap needs , separated package names.
-	# Don't change $PACKAGES in config.sh to include ','
-	# This is done to maintain consistency
-	PACKAGES=$(echo $PACKAGES | sed  -e 's/ /,/g' )
-	EXTRA_PKGS=$(echo $EXTRA_PKGS | sed  -e 's/ /,/g' )
-
-	# extra packages are added to packages and finally passed to debootstrap
-	if [ "${EXTRA_PKGS}" = ""  ]; then
-		echo "no extra packages"
-	else
-		PACKAGES="${PACKAGES},${EXTRA_PKGS}"
+[intel-sgx]
+source=https://download.01.org/intel-sgx/sgx_repo/ubuntu
+suite=$SUITE
+packages=libtdx-attest=1.22\*
+EOF
 	fi
 
-	${PKG_MANAGER} --variant=minbase \
-		--arch=${ARCHITECTURE}\
-		--include="$PACKAGES" \
-		${OS_NAME} \
-		${ROOTFS_DIR}
+	# This fixes the spurious error
+	# E: Can't find a source to download version '2021.03.26' of 'ubuntu-keyring:amd64'
+	apt update
 
-	chroot $ROOTFS_DIR ln -s /lib/systemd/systemd /usr/lib/systemd/systemd
+	if ! multistrap -a "$DEB_ARCH" -d "$rootfs_dir" -f "$multistrap_conf"; then
+		if [ "$OS_VERSION" = "focal" ]; then	
+			echo "WARN: multistrap failed, proceed with hack for Ubuntu 20.04"
+			build_dbus $rootfs_dir
+		else
+			echo "ERROR: multistrap failed, cannot proceed" && exit 1
+		fi
+	else
+		echo "INFO: multistrap succeeded"
+	fi
+	rm -rf "$rootfs_dir/var/run"
+	ln -s /run "$rootfs_dir/var/run"
+	cp --remove-destination /etc/resolv.conf "$rootfs_dir/etc"
 
-    # Reduce image size and memory footprint
-    # removing not needed files and directories.
-    chroot $ROOTFS_DIR rm -rf /usr/share/{bash-completion,bug,doc,info,lintian,locale,man,menu,misc,pixmaps,terminfo,zoneinfo,zsh}
+	local dir="$rootfs_dir/etc/ssl/certs"
+	mkdir -p "$dir"
+	cp --remove-destination /etc/ssl/certs/ca-certificates.crt "$dir"
+
+	# Reduce image size and memory footprint by removing unnecessary files and directories.
+	rm -rf $rootfs_dir/usr/share/{bash-completion,bug,doc,info,lintian,locale,man,menu,misc,pixmaps,terminfo,zsh}
+
+	# Minimal set of device nodes needed when AGENT_INIT=yes so that the
+	# kernel can properly setup stdout/stdin/stderr for us
+	pushd $rootfs_dir/dev
+	MAKEDEV -v console tty ttyS null zero fd
+	popd
 }

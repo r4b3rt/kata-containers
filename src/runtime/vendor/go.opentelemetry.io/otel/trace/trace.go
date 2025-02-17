@@ -20,20 +20,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/label"
 )
 
 const (
 	// FlagsSampled is a bitmask with the sampled bit set. A SpanContext
 	// with the sampling bit set means the span is sampled.
-	FlagsSampled = byte(0x01)
-	// FlagsDeferred is a bitmask with the deferred bit set. A SpanContext
-	// with the deferred bit set means the sampling decision has been
-	// defered to the receiver.
-	FlagsDeferred = byte(0x02)
-	// FlagsDebug is a bitmask with the debug bit set.
-	FlagsDebug = byte(0x04)
+	FlagsSampled = TraceFlags(0x01)
 
 	errInvalidHexID errorConst = "trace-id and span-id can only contain [0-9a-f] characters, all lowercase"
 
@@ -51,7 +45,7 @@ func (e errorConst) Error() string {
 }
 
 // TraceID is a unique identity of a trace.
-// nolint:golint
+// nolint:revive // revive complains about stutter of `trace.TraceID`.
 type TraceID [16]byte
 
 var nilTraceID TraceID
@@ -69,7 +63,7 @@ func (t TraceID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(t.String())
 }
 
-// String returns the hex string representation form of a TraceID
+// String returns the hex string representation form of a TraceID.
 func (t TraceID) String() string {
 	return hex.EncodeToString(t[:])
 }
@@ -92,7 +86,7 @@ func (s SpanID) MarshalJSON() ([]byte, error) {
 	return json.Marshal(s.String())
 }
 
-// String returns the hex string representation form of a SpanID
+// String returns the hex string representation form of a SpanID.
 func (s SpanID) String() string {
 	return hex.EncodeToString(s[:])
 }
@@ -100,7 +94,7 @@ func (s SpanID) String() string {
 // TraceIDFromHex returns a TraceID from a hex string if it is compliant with
 // the W3C trace-context specification.  See more at
 // https://www.w3.org/TR/trace-context/#trace-id
-// nolint:golint
+// nolint:revive // revive complains about stutter of `trace.TraceIDFromHex`.
 func TraceIDFromHex(h string) (TraceID, error) {
 	t := TraceID{}
 	if len(h) != 32 {
@@ -157,12 +151,66 @@ func decodeHex(h string, b []byte) error {
 	return nil
 }
 
-// SpanContext contains identifying trace information about a Span.
-type SpanContext struct {
+// TraceFlags contains flags that can be set on a SpanContext.
+type TraceFlags byte //nolint:revive // revive complains about stutter of `trace.TraceFlags`.
+
+// IsSampled returns if the sampling bit is set in the TraceFlags.
+func (tf TraceFlags) IsSampled() bool {
+	return tf&FlagsSampled == FlagsSampled
+}
+
+// WithSampled sets the sampling bit in a new copy of the TraceFlags.
+func (tf TraceFlags) WithSampled(sampled bool) TraceFlags { // nolint:revive  // sampled is not a control flag.
+	if sampled {
+		return tf | FlagsSampled
+	}
+
+	return tf &^ FlagsSampled
+}
+
+// MarshalJSON implements a custom marshal function to encode TraceFlags
+// as a hex string.
+func (tf TraceFlags) MarshalJSON() ([]byte, error) {
+	return json.Marshal(tf.String())
+}
+
+// String returns the hex string representation form of TraceFlags.
+func (tf TraceFlags) String() string {
+	return hex.EncodeToString([]byte{byte(tf)}[:])
+}
+
+// SpanContextConfig contains mutable fields usable for constructing
+// an immutable SpanContext.
+type SpanContextConfig struct {
 	TraceID    TraceID
 	SpanID     SpanID
-	TraceFlags byte
+	TraceFlags TraceFlags
+	TraceState TraceState
+	Remote     bool
 }
+
+// NewSpanContext constructs a SpanContext using values from the provided
+// SpanContextConfig.
+func NewSpanContext(config SpanContextConfig) SpanContext {
+	return SpanContext{
+		traceID:    config.TraceID,
+		spanID:     config.SpanID,
+		traceFlags: config.TraceFlags,
+		traceState: config.TraceState,
+		remote:     config.Remote,
+	}
+}
+
+// SpanContext contains identifying trace information about a Span.
+type SpanContext struct {
+	traceID    TraceID
+	spanID     SpanID
+	traceFlags TraceFlags
+	traceState TraceState
+	remote     bool
+}
+
+var _ json.Marshaler = SpanContext{}
 
 // IsValid returns if the SpanContext is valid. A valid span context has a
 // valid TraceID and SpanID.
@@ -170,87 +218,133 @@ func (sc SpanContext) IsValid() bool {
 	return sc.HasTraceID() && sc.HasSpanID()
 }
 
+// IsRemote indicates whether the SpanContext represents a remotely-created Span.
+func (sc SpanContext) IsRemote() bool {
+	return sc.remote
+}
+
+// WithRemote returns a copy of sc with the Remote property set to remote.
+func (sc SpanContext) WithRemote(remote bool) SpanContext {
+	return SpanContext{
+		traceID:    sc.traceID,
+		spanID:     sc.spanID,
+		traceFlags: sc.traceFlags,
+		traceState: sc.traceState,
+		remote:     remote,
+	}
+}
+
+// TraceID returns the TraceID from the SpanContext.
+func (sc SpanContext) TraceID() TraceID {
+	return sc.traceID
+}
+
 // HasTraceID checks if the SpanContext has a valid TraceID.
 func (sc SpanContext) HasTraceID() bool {
-	return sc.TraceID.IsValid()
+	return sc.traceID.IsValid()
+}
+
+// WithTraceID returns a new SpanContext with the TraceID replaced.
+func (sc SpanContext) WithTraceID(traceID TraceID) SpanContext {
+	return SpanContext{
+		traceID:    traceID,
+		spanID:     sc.spanID,
+		traceFlags: sc.traceFlags,
+		traceState: sc.traceState,
+		remote:     sc.remote,
+	}
+}
+
+// SpanID returns the SpanID from the SpanContext.
+func (sc SpanContext) SpanID() SpanID {
+	return sc.spanID
 }
 
 // HasSpanID checks if the SpanContext has a valid SpanID.
 func (sc SpanContext) HasSpanID() bool {
-	return sc.SpanID.IsValid()
+	return sc.spanID.IsValid()
 }
 
-// IsDeferred returns if the deferred bit is set in the trace flags.
-func (sc SpanContext) IsDeferred() bool {
-	return sc.TraceFlags&FlagsDeferred == FlagsDeferred
+// WithSpanID returns a new SpanContext with the SpanID replaced.
+func (sc SpanContext) WithSpanID(spanID SpanID) SpanContext {
+	return SpanContext{
+		traceID:    sc.traceID,
+		spanID:     spanID,
+		traceFlags: sc.traceFlags,
+		traceState: sc.traceState,
+		remote:     sc.remote,
+	}
 }
 
-// IsDebug returns if the debug bit is set in the trace flags.
-func (sc SpanContext) IsDebug() bool {
-	return sc.TraceFlags&FlagsDebug == FlagsDebug
+// TraceFlags returns the flags from the SpanContext.
+func (sc SpanContext) TraceFlags() TraceFlags {
+	return sc.traceFlags
 }
 
-// IsSampled returns if the sampling bit is set in the trace flags.
+// IsSampled returns if the sampling bit is set in the SpanContext's TraceFlags.
 func (sc SpanContext) IsSampled() bool {
-	return sc.TraceFlags&FlagsSampled == FlagsSampled
+	return sc.traceFlags.IsSampled()
 }
 
-type traceContextKeyType int
-
-const (
-	currentSpanKey traceContextKeyType = iota
-	remoteContextKey
-)
-
-// ContextWithSpan returns a copy of parent with span set to current.
-func ContextWithSpan(parent context.Context, span Span) context.Context {
-	return context.WithValue(parent, currentSpanKey, span)
-}
-
-// SpanFromContext returns the current span from ctx, or noop span if none set.
-func SpanFromContext(ctx context.Context) Span {
-	if span, ok := ctx.Value(currentSpanKey).(Span); ok {
-		return span
+// WithTraceFlags returns a new SpanContext with the TraceFlags replaced.
+func (sc SpanContext) WithTraceFlags(flags TraceFlags) SpanContext {
+	return SpanContext{
+		traceID:    sc.traceID,
+		spanID:     sc.spanID,
+		traceFlags: flags,
+		traceState: sc.traceState,
+		remote:     sc.remote,
 	}
-	return noopSpan{}
 }
 
-// SpanContextFromContext returns the current SpanContext from ctx, or an empty SpanContext if none set.
-func SpanContextFromContext(ctx context.Context) SpanContext {
-	if span := SpanFromContext(ctx); span != nil {
-		return span.SpanContext()
+// TraceState returns the TraceState from the SpanContext.
+func (sc SpanContext) TraceState() TraceState {
+	return sc.traceState
+}
+
+// WithTraceState returns a new SpanContext with the TraceState replaced.
+func (sc SpanContext) WithTraceState(state TraceState) SpanContext {
+	return SpanContext{
+		traceID:    sc.traceID,
+		spanID:     sc.spanID,
+		traceFlags: sc.traceFlags,
+		traceState: state,
+		remote:     sc.remote,
 	}
-	return SpanContext{}
 }
 
-// ContextWithRemoteSpanContext returns a copy of parent with a remote set as
-// the remote span context.
-func ContextWithRemoteSpanContext(parent context.Context, remote SpanContext) context.Context {
-	return context.WithValue(parent, remoteContextKey, remote)
+// Equal is a predicate that determines whether two SpanContext values are equal.
+func (sc SpanContext) Equal(other SpanContext) bool {
+	return sc.traceID == other.traceID &&
+		sc.spanID == other.spanID &&
+		sc.traceFlags == other.traceFlags &&
+		sc.traceState.String() == other.traceState.String() &&
+		sc.remote == other.remote
 }
 
-// RemoteSpanContextFromContext returns the remote span context from ctx.
-func RemoteSpanContextFromContext(ctx context.Context) SpanContext {
-	if sc, ok := ctx.Value(remoteContextKey).(SpanContext); ok {
-		return sc
-	}
-	return SpanContext{}
+// MarshalJSON implements a custom marshal function to encode a SpanContext.
+func (sc SpanContext) MarshalJSON() ([]byte, error) {
+	return json.Marshal(SpanContextConfig{
+		TraceID:    sc.traceID,
+		SpanID:     sc.spanID,
+		TraceFlags: sc.traceFlags,
+		TraceState: sc.traceState,
+		Remote:     sc.remote,
+	})
 }
 
 // Span is the individual component of a trace. It represents a single named
 // and timed operation of a workflow that is traced. A Tracer is used to
 // create a Span and it is then up to the operation the Span represents to
 // properly end the Span when the operation itself ends.
+//
+// Warning: methods may be added to this interface in minor releases.
 type Span interface {
-	// Tracer returns the Tracer that created the Span. Tracer MUST NOT be
-	// nil.
-	Tracer() Tracer
-
 	// End completes the Span. The Span is considered complete and ready to be
 	// delivered through the rest of the telemetry pipeline after this method
 	// is called. Therefore, updates to the Span are not allowed after this
 	// method has been called.
-	End(options ...SpanOption)
+	End(options ...SpanEndOption)
 
 	// AddEvent adds an event with the provided name and options.
 	AddEvent(name string, options ...EventOption)
@@ -259,17 +353,21 @@ type Span interface {
 	// true if the Span is active and events can be recorded.
 	IsRecording() bool
 
-	// RecordError records an error as a Span event.
+	// RecordError will record err as an exception span event for this span. An
+	// additional call to SetStatus is required if the Status of the Span should
+	// be set to Error, as this method does not change the Span status. If this
+	// span is not being recorded or err is nil then this method does nothing.
 	RecordError(err error, options ...EventOption)
 
-	// SpanContext returns the SpanContext of the Span. The returned
-	// SpanContext is usable even after the End has been called for the Span.
+	// SpanContext returns the SpanContext of the Span. The returned SpanContext
+	// is usable even after the End method has been called for the Span.
 	SpanContext() SpanContext
 
 	// SetStatus sets the status of the Span in the form of a code and a
-	// message. SetStatus overrides the value of previous calls to SetStatus
-	// on the Span.
-	SetStatus(code codes.Code, msg string)
+	// description, provided the status hasn't already been set to a higher
+	// value before (OK > Error > Unset). The description is only included in a
+	// status when the code is for an error.
+	SetStatus(code codes.Code, description string)
 
 	// SetName sets the Span name.
 	SetName(name string)
@@ -277,7 +375,11 @@ type Span interface {
 	// SetAttributes sets kv as attributes of the Span. If a key from kv
 	// already exists for an attribute of the Span it will be overwritten with
 	// the value contained in kv.
-	SetAttributes(kv ...label.KeyValue)
+	SetAttributes(kv ...attribute.KeyValue)
+
+	// TracerProvider returns a TracerProvider that can be used to generate
+	// additional Spans on the same telemetry pipeline as the current Span.
+	TracerProvider() TracerProvider
 }
 
 // Link is the relationship between two Spans. The relationship can be within
@@ -285,19 +387,30 @@ type Span interface {
 //
 // For example, a Link is used in the following situations:
 //
-//   1. Batch Processing: A batch of operations may contain operations
-//      associated with one or more traces/spans. Since there can only be one
-//      parent SpanContext, a Link is used to keep reference to the
-//      SpanContext of all operations in the batch.
-//   2. Public Endpoint: A SpanContext for an in incoming client request on a
-//      public endpoint should be considered untrusted. In such a case, a new
-//      trace with its own identity and sampling decision needs to be created,
-//      but this new trace needs to be related to the original trace in some
-//      form. A Link is used to keep reference to the original SpanContext and
-//      track the relationship.
+//  1. Batch Processing: A batch of operations may contain operations
+//     associated with one or more traces/spans. Since there can only be one
+//     parent SpanContext, a Link is used to keep reference to the
+//     SpanContext of all operations in the batch.
+//  2. Public Endpoint: A SpanContext for an in incoming client request on a
+//     public endpoint should be considered untrusted. In such a case, a new
+//     trace with its own identity and sampling decision needs to be created,
+//     but this new trace needs to be related to the original trace in some
+//     form. A Link is used to keep reference to the original SpanContext and
+//     track the relationship.
 type Link struct {
-	SpanContext
-	Attributes []label.KeyValue
+	// SpanContext of the linked Span.
+	SpanContext SpanContext
+
+	// Attributes describe the aspects of the link.
+	Attributes []attribute.KeyValue
+}
+
+// LinkFromContext returns a link encapsulating the SpanContext in the provided ctx.
+func LinkFromContext(ctx context.Context, attrs ...attribute.KeyValue) Link {
+	return Link{
+		SpanContext: SpanContextFromContext(ctx),
+		Attributes:  attrs,
+	}
 }
 
 // SpanKind is the role a Span plays in a Trace.
@@ -372,18 +485,67 @@ func (sk SpanKind) String() string {
 }
 
 // Tracer is the creator of Spans.
+//
+// Warning: methods may be added to this interface in minor releases.
 type Tracer interface {
-	// Start creates a span.
-	Start(ctx context.Context, spanName string, opts ...SpanOption) (context.Context, Span)
+	// Start creates a span and a context.Context containing the newly-created span.
+	//
+	// If the context.Context provided in `ctx` contains a Span then the newly-created
+	// Span will be a child of that span, otherwise it will be a root span. This behavior
+	// can be overridden by providing `WithNewRoot()` as a SpanOption, causing the
+	// newly-created Span to be a root span even if `ctx` contains a Span.
+	//
+	// When creating a Span it is recommended to provide all known span attributes using
+	// the `WithAttributes()` SpanOption as samplers will only have access to the
+	// attributes provided when a Span is created.
+	//
+	// Any Span that is created MUST also be ended. This is the responsibility of the user.
+	// Implementations of this API may leak memory or other resources if Spans are not ended.
+	Start(ctx context.Context, spanName string, opts ...SpanStartOption) (context.Context, Span)
 }
 
-// TracerProvider provides access to instrumentation Tracers.
+// TracerProvider provides Tracers that are used by instrumentation code to
+// trace computational workflows.
+//
+// A TracerProvider is the collection destination of all Spans from Tracers it
+// provides, it represents a unique telemetry collection pipeline. How that
+// pipeline is defined, meaning how those Spans are collected, processed, and
+// where they are exported, depends on its implementation. Instrumentation
+// authors do not need to define this implementation, rather just use the
+// provided Tracers to instrument code.
+//
+// Commonly, instrumentation code will accept a TracerProvider implementation
+// at runtime from its users or it can simply use the globally registered one
+// (see https://pkg.go.dev/go.opentelemetry.io/otel#GetTracerProvider).
+//
+// Warning: methods may be added to this interface in minor releases.
 type TracerProvider interface {
-	// Tracer creates an implementation of the Tracer interface.
-	// The instrumentationName must be the name of the library providing
-	// instrumentation. This name may be the same as the instrumented code
-	// only if that code provides built-in instrumentation. If the
-	// instrumentationName is empty, then a implementation defined default
-	// name will be used instead.
-	Tracer(instrumentationName string, opts ...TracerOption) Tracer
+	// Tracer returns a unique Tracer scoped to be used by instrumentation code
+	// to trace computational workflows. The scope and identity of that
+	// instrumentation code is uniquely defined by the name and options passed.
+	//
+	// The passed name needs to uniquely identify instrumentation code.
+	// Therefore, it is recommended that name is the Go package name of the
+	// library providing instrumentation (note: not the code being
+	// instrumented). Instrumentation libraries can have multiple versions,
+	// therefore, the WithInstrumentationVersion option should be used to
+	// distinguish these different codebases. Additionally, instrumentation
+	// libraries may sometimes use traces to communicate different domains of
+	// workflow data (i.e. using spans to communicate workflow events only). If
+	// this is the case, the WithScopeAttributes option should be used to
+	// uniquely identify Tracers that handle the different domains of workflow
+	// data.
+	//
+	// If the same name and options are passed multiple times, the same Tracer
+	// will be returned (it is up to the implementation if this will be the
+	// same underlying instance of that Tracer or not). It is not necessary to
+	// call this multiple times with the same name and options to get an
+	// up-to-date Tracer. All implementations will ensure any TracerProvider
+	// configuration changes are propagated to all provided Tracers.
+	//
+	// If name is empty, then an implementation defined default name will be
+	// used instead.
+	//
+	// This method is safe to call concurrently.
+	Tracer(name string, options ...TracerOption) Tracer
 }

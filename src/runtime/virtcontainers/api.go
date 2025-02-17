@@ -9,19 +9,19 @@ import (
 	"context"
 	"runtime"
 
+	deviceApi "github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	deviceConfig "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
-	deviceApi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	deviceConfig "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
+	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/sirupsen/logrus"
 )
 
 // apiTracingTags defines tags for the trace span
 var apiTracingTags = map[string]string{
 	"source":    "runtime",
-	"packages":  "virtcontainers",
+	"package":   "virtcontainers",
 	"subsystem": "api",
 }
 
@@ -35,25 +35,25 @@ var virtLog = logrus.WithField("source", "virtcontainers")
 func SetLogger(ctx context.Context, logger *logrus.Entry) {
 	fields := virtLog.Data
 	virtLog = logger.WithFields(fields)
-
+	SetHypervisorLogger(virtLog) // TODO: this will move to hypervisors pkg
 	deviceApi.SetLogger(virtLog)
 	compatoci.SetLogger(virtLog)
 	deviceConfig.SetLogger(virtLog)
-	cgroups.SetLogger(virtLog)
+	resCtrl.SetLogger(virtLog)
 }
 
 // CreateSandbox is the virtcontainers sandbox creation entry point.
 // CreateSandbox creates a sandbox and its containers. It does not start them.
-func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (VCSandbox, error) {
+func CreateSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factory, prestartHookFunc func(context.Context) error) (VCSandbox, error) {
 	span, ctx := katatrace.Trace(ctx, virtLog, "CreateSandbox", apiTracingTags)
 	defer span.End()
 
-	s, err := createSandboxFromConfig(ctx, sandboxConfig, factory)
+	s, err := createSandboxFromConfig(ctx, sandboxConfig, factory, prestartHookFunc)
 
 	return s, err
 }
 
-func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, factory Factory) (_ *Sandbox, err error) {
+func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, factory Factory, prestartHookFunc func(context.Context) error) (_ *Sandbox, err error) {
 	span, ctx := katatrace.Trace(ctx, virtLog, "createSandboxFromConfig", apiTracingTags)
 	defer span.End()
 
@@ -63,10 +63,18 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 		return nil, err
 	}
 
-	// cleanup sandbox resources in case of any failure
+	// Cleanup sandbox resources in case of any failure
 	defer func() {
 		if err != nil {
 			s.Delete(ctx)
+		}
+	}()
+
+	// network rollback
+	defer func() {
+		if err != nil {
+			virtLog.Info("Removing network after failure in createSandbox")
+			s.removeNetwork(ctx)
 		}
 	}()
 
@@ -75,26 +83,13 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 		return nil, err
 	}
 
-	// network rollback
-	defer func() {
-		if err != nil {
-			s.removeNetwork(ctx)
-		}
-	}()
-
-	// Move runtime to sandbox cgroup so all process are created there.
-	if s.config.SandboxCgroupOnly {
-		if err := s.createCgroupManager(); err != nil {
-			return nil, err
-		}
-
-		if err := s.setupSandboxCgroup(); err != nil {
-			return nil, err
-		}
+	// Set the sandbox host cgroups.
+	if err := s.setupResourceController(); err != nil {
+		return nil, err
 	}
 
 	// Start the VM
-	if err = s.startVM(ctx); err != nil {
+	if err = s.startVM(ctx, prestartHookFunc); err != nil {
 		return nil, err
 	}
 

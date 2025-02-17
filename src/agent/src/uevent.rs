@@ -11,7 +11,6 @@ use slog::Logger;
 
 use anyhow::{anyhow, Result};
 use netlink_sys::{protocols, SocketAddr, TokioSocket};
-use nix::errno::Errno;
 use std::fmt::Debug;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
@@ -20,11 +19,9 @@ use tokio::sync::watch::Receiver;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-// Convenience macro to obtain the scope logger
-macro_rules! sl {
-    () => {
-        slog_scope::logger().new(o!("subsystem" => "uevent"))
-    };
+// Convenience function to obtain the scope logger.
+fn sl() -> slog::Logger {
+    slog_scope::logger().new(o!("subsystem" => "uevent"))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -98,9 +95,17 @@ impl Uevent {
     }
 
     #[instrument]
+    async fn process_remove(&self, logger: &Logger, sandbox: &Arc<Mutex<Sandbox>>) {
+        let mut sb = sandbox.lock().await;
+        sb.uevent_map.remove(&self.devpath);
+    }
+
+    #[instrument]
     async fn process(&self, logger: &Logger, sandbox: &Arc<Mutex<Sandbox>>) {
         if self.action == U_EVENT_ACTION_ADD {
             return self.process_add(logger, sandbox).await;
+        } else if self.action == U_EVENT_ACTION_REMOVE {
+            return self.process_remove(logger, sandbox).await;
         }
         debug!(*logger, "ignoring event"; "uevent" => format!("{:?}", self));
     }
@@ -111,10 +116,13 @@ pub async fn wait_for_uevent(
     sandbox: &Arc<Mutex<Sandbox>>,
     matcher: impl UeventMatcher,
 ) -> Result<Uevent> {
+    let logprefix = format!("Waiting for {:?}", &matcher);
+
+    info!(sl(), "{}", logprefix);
     let mut sb = sandbox.lock().await;
     for uev in sb.uevent_map.values() {
         if matcher.is_match(uev) {
-            info!(sl!(), "Device {:?} found in device map", uev);
+            info!(sl(), "{}: found {:?} in uevent map", logprefix, &uev);
             return Ok(uev.clone());
         }
     }
@@ -129,8 +137,9 @@ pub async fn wait_for_uevent(
     sb.uevent_watchers.push(Some((Box::new(matcher), tx)));
     drop(sb); // unlock
 
-    info!(sl!(), "Waiting on channel for uevent notification\n");
-    let hotplug_timeout = AGENT_CONFIG.read().await.hotplug_timeout;
+    info!(sl(), "{}: waiting on channel", logprefix);
+
+    let hotplug_timeout = AGENT_CONFIG.hotplug_timeout;
 
     let uev = match tokio::time::timeout(hotplug_timeout, rx).await {
         Ok(v) => v?,
@@ -146,6 +155,7 @@ pub async fn wait_for_uevent(
         }
     };
 
+    info!(sl(), "{}: found {:?} on channel", logprefix, &uev);
     Ok(uev)
 }
 
@@ -190,7 +200,7 @@ pub async fn watch_uevents(
                     Ok((buf, addr)) => {
                         if addr.port_number() != 0 {
                             // not our netlink message
-                            let err_msg = format!("{:?}", nix::Error::Sys(Errno::EBADMSG));
+                            let err_msg = format!("{:?}", nix::Error::EBADMSG);
                             error!(logger, "receive uevent message failed"; "error" => err_msg);
                             continue;
                         }
@@ -227,7 +237,6 @@ pub(crate) fn spawn_test_watcher(sandbox: Arc<Mutex<Sandbox>>, uev: Uevent) {
                     if matcher.is_match(&uev) {
                         let (_, sender) = watch.take().unwrap();
                         let _ = sender.send(uev.clone());
-                        return;
                     }
                 }
             });

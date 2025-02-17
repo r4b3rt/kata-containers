@@ -9,7 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
@@ -28,17 +28,22 @@ const (
 	// InitrdAsset is an initrd asset.
 	InitrdAsset AssetType = "initrd"
 
+	// SecureBootAsset is a secure boot asset.
+	// (IBM Z Secure Execution only)
+	SecureBootAsset AssetType = "secure_boot"
+
 	// HypervisorAsset is an hypervisor asset.
 	HypervisorAsset AssetType = "hypervisor"
-
-	// HypervisorCtlAsset is a hypervisor control asset.
-	HypervisorCtlAsset AssetType = "hypervisorctl"
 
 	// JailerAsset is a jailer asset.
 	JailerAsset AssetType = "jailer"
 
 	// FirmwareAsset is a firmware asset.
 	FirmwareAsset AssetType = "firmware"
+
+	FirmwareVolumeAsset AssetType = "firmware_volume"
+
+	UnkownAsset AssetType = "unknown"
 )
 
 // AssetTypes returns a list of all known asset types.
@@ -47,8 +52,8 @@ const (
 func AssetTypes() []AssetType {
 	return []AssetType{
 		FirmwareAsset,
+		FirmwareVolumeAsset,
 		HypervisorAsset,
-		HypervisorCtlAsset,
 		ImageAsset,
 		InitrdAsset,
 		JailerAsset,
@@ -83,12 +88,12 @@ func (t AssetType) Annotations() (string, string, error) {
 		return annotations.InitrdPath, annotations.InitrdHash, nil
 	case HypervisorAsset:
 		return annotations.HypervisorPath, annotations.HypervisorHash, nil
-	case HypervisorCtlAsset:
-		return annotations.HypervisorCtlPath, annotations.HypervisorCtlHash, nil
 	case JailerAsset:
 		return annotations.JailerPath, annotations.JailerHash, nil
 	case FirmwareAsset:
 		return annotations.FirmwarePath, annotations.FirmwareHash, nil
+	case FirmwareVolumeAsset:
+		return annotations.FirmwareVolumePath, annotations.FirmwareVolumeHash, nil
 	}
 
 	return "", "", fmt.Errorf("Wrong asset type %s", t)
@@ -132,7 +137,7 @@ func (a *Asset) Hash(hashType string) (string, error) {
 	var hash string
 
 	// We read the actual asset content
-	bytes, err := ioutil.ReadFile(a.path)
+	bytes, err := os.ReadFile(a.path)
 	if err != nil {
 		return "", err
 	}

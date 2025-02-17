@@ -10,10 +10,9 @@ import (
 	"io"
 
 	"github.com/go-openapi/runtime"
+	"github.com/go-openapi/strfmt"
 
-	strfmt "github.com/go-openapi/strfmt"
-
-	models "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
 )
 
 // PatchMachineConfigurationReader is a Reader for the PatchMachineConfiguration structure.
@@ -24,21 +23,18 @@ type PatchMachineConfigurationReader struct {
 // ReadResponse reads a server response into the received o.
 func (o *PatchMachineConfigurationReader) ReadResponse(response runtime.ClientResponse, consumer runtime.Consumer) (interface{}, error) {
 	switch response.Code() {
-
 	case 204:
 		result := NewPatchMachineConfigurationNoContent()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return result, nil
-
 	case 400:
 		result := NewPatchMachineConfigurationBadRequest()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return nil, result
-
 	default:
 		result := NewPatchMachineConfigurationDefault(response.Code())
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
@@ -56,14 +52,44 @@ func NewPatchMachineConfigurationNoContent() *PatchMachineConfigurationNoContent
 	return &PatchMachineConfigurationNoContent{}
 }
 
-/*PatchMachineConfigurationNoContent handles this case with default header values.
+/*
+PatchMachineConfigurationNoContent describes a response with status code 204, with default header values.
 
 Machine Configuration created/updated
 */
 type PatchMachineConfigurationNoContent struct {
 }
 
+// IsSuccess returns true when this patch machine configuration no content response has a 2xx status code
+func (o *PatchMachineConfigurationNoContent) IsSuccess() bool {
+	return true
+}
+
+// IsRedirect returns true when this patch machine configuration no content response has a 3xx status code
+func (o *PatchMachineConfigurationNoContent) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this patch machine configuration no content response has a 4xx status code
+func (o *PatchMachineConfigurationNoContent) IsClientError() bool {
+	return false
+}
+
+// IsServerError returns true when this patch machine configuration no content response has a 5xx status code
+func (o *PatchMachineConfigurationNoContent) IsServerError() bool {
+	return false
+}
+
+// IsCode returns true when this patch machine configuration no content response a status code equal to that given
+func (o *PatchMachineConfigurationNoContent) IsCode(code int) bool {
+	return code == 204
+}
+
 func (o *PatchMachineConfigurationNoContent) Error() string {
+	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfigurationNoContent ", 204)
+}
+
+func (o *PatchMachineConfigurationNoContent) String() string {
 	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfigurationNoContent ", 204)
 }
 
@@ -77,7 +103,8 @@ func NewPatchMachineConfigurationBadRequest() *PatchMachineConfigurationBadReque
 	return &PatchMachineConfigurationBadRequest{}
 }
 
-/*PatchMachineConfigurationBadRequest handles this case with default header values.
+/*
+PatchMachineConfigurationBadRequest describes a response with status code 400, with default header values.
 
 Machine Configuration cannot be updated due to bad input
 */
@@ -85,8 +112,41 @@ type PatchMachineConfigurationBadRequest struct {
 	Payload *models.Error
 }
 
+// IsSuccess returns true when this patch machine configuration bad request response has a 2xx status code
+func (o *PatchMachineConfigurationBadRequest) IsSuccess() bool {
+	return false
+}
+
+// IsRedirect returns true when this patch machine configuration bad request response has a 3xx status code
+func (o *PatchMachineConfigurationBadRequest) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this patch machine configuration bad request response has a 4xx status code
+func (o *PatchMachineConfigurationBadRequest) IsClientError() bool {
+	return true
+}
+
+// IsServerError returns true when this patch machine configuration bad request response has a 5xx status code
+func (o *PatchMachineConfigurationBadRequest) IsServerError() bool {
+	return false
+}
+
+// IsCode returns true when this patch machine configuration bad request response a status code equal to that given
+func (o *PatchMachineConfigurationBadRequest) IsCode(code int) bool {
+	return code == 400
+}
+
 func (o *PatchMachineConfigurationBadRequest) Error() string {
 	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfigurationBadRequest  %+v", 400, o.Payload)
+}
+
+func (o *PatchMachineConfigurationBadRequest) String() string {
+	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfigurationBadRequest  %+v", 400, o.Payload)
+}
+
+func (o *PatchMachineConfigurationBadRequest) GetPayload() *models.Error {
+	return o.Payload
 }
 
 func (o *PatchMachineConfigurationBadRequest) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
@@ -108,7 +168,8 @@ func NewPatchMachineConfigurationDefault(code int) *PatchMachineConfigurationDef
 	}
 }
 
-/*PatchMachineConfigurationDefault handles this case with default header values.
+/*
+PatchMachineConfigurationDefault describes a response with status code -1, with default header values.
 
 Internal server error
 */
@@ -123,8 +184,41 @@ func (o *PatchMachineConfigurationDefault) Code() int {
 	return o._statusCode
 }
 
+// IsSuccess returns true when this patch machine configuration default response has a 2xx status code
+func (o *PatchMachineConfigurationDefault) IsSuccess() bool {
+	return o._statusCode/100 == 2
+}
+
+// IsRedirect returns true when this patch machine configuration default response has a 3xx status code
+func (o *PatchMachineConfigurationDefault) IsRedirect() bool {
+	return o._statusCode/100 == 3
+}
+
+// IsClientError returns true when this patch machine configuration default response has a 4xx status code
+func (o *PatchMachineConfigurationDefault) IsClientError() bool {
+	return o._statusCode/100 == 4
+}
+
+// IsServerError returns true when this patch machine configuration default response has a 5xx status code
+func (o *PatchMachineConfigurationDefault) IsServerError() bool {
+	return o._statusCode/100 == 5
+}
+
+// IsCode returns true when this patch machine configuration default response a status code equal to that given
+func (o *PatchMachineConfigurationDefault) IsCode(code int) bool {
+	return o._statusCode == code
+}
+
 func (o *PatchMachineConfigurationDefault) Error() string {
 	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfiguration default  %+v", o._statusCode, o.Payload)
+}
+
+func (o *PatchMachineConfigurationDefault) String() string {
+	return fmt.Sprintf("[PATCH /machine-config][%d] patchMachineConfiguration default  %+v", o._statusCode, o.Payload)
+}
+
+func (o *PatchMachineConfigurationDefault) GetPayload() *models.Error {
+	return o.Payload
 }
 
 func (o *PatchMachineConfigurationDefault) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {

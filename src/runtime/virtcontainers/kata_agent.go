@@ -6,11 +6,13 @@
 package virtcontainers
 
 import (
+	"context"
+	b64 "encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,27 +20,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/go-units"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/katautils/katatrace"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	kataclient "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/client"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
-	vccgroups "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/uuid"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 
-	"github.com/gogo/protobuf/proto"
+	ctrAnnotations "github.com/containerd/containerd/pkg/cri/annotations"
+	podmanAnnotations "github.com/containers/podman/v4/pkg/annotations"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	grpcStatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // kataAgentTracingTags defines tags for the trace span
@@ -62,88 +70,98 @@ const (
 	// path to vfio devices
 	vfioPath = "/dev/vfio/"
 
-	sandboxMountsDir = "sandbox-mounts"
+	VirtualVolumePrefix = "io.katacontainers.volume="
 
 	// enable debug console
 	kernelParamDebugConsole           = "agent.debug_console"
 	kernelParamDebugConsoleVPort      = "agent.debug_console_vport"
 	kernelParamDebugConsoleVPortValue = "1026"
+
+	// Default SELinux type applied to the container process inside guest
+	defaultSeLinuxContainerType = "container_t"
 )
+
+type customRequestTimeoutKeyType struct{}
 
 var (
-	checkRequestTimeout         = 30 * time.Second
-	defaultRequestTimeout       = 60 * time.Second
-	errorMissingOCISpec         = errors.New("Missing OCI specification")
-	defaultKataHostSharedDir    = "/run/kata-containers/shared/sandboxes/"
-	defaultKataGuestSharedDir   = "/run/kata-containers/shared/containers/"
-	mountGuestTag               = "kataShared"
-	defaultKataGuestSandboxDir  = "/run/kata-containers/sandbox/"
-	type9pFs                    = "9p"
-	typeVirtioFS                = "virtiofs"
-	typeVirtioFSNoCache         = "none"
-	kata9pDevType               = "9p"
-	kataMmioBlkDevType          = "mmioblk"
-	kataBlkDevType              = "blk"
-	kataBlkCCWDevType           = "blk-ccw"
-	kataSCSIDevType             = "scsi"
-	kataNvdimmDevType           = "nvdimm"
-	kataVirtioFSDevType         = "virtio-fs"
-	kataWatchableBindDevType    = "watchable-bind"
-	sharedDir9pOptions          = []string{"trans=virtio,version=9p2000.L,cache=mmap", "nodev"}
-	sharedDirVirtioFSOptions    = []string{}
-	sharedDirVirtioFSDaxOptions = "dax"
-	shmDir                      = "shm"
-	kataEphemeralDevType        = "ephemeral"
-	defaultEphemeralPath        = filepath.Join(defaultKataGuestSandboxDir, kataEphemeralDevType)
-	grpcMaxDataSize             = int64(1024 * 1024)
-	localDirOptions             = []string{"mode=0777"}
-	maxHostnameLen              = 64
-	GuestDNSFile                = "/etc/resolv.conf"
+	checkRequestTimeout              = 30 * time.Second
+	createContainerRequestTimeout    = 60 * time.Second
+	defaultRequestTimeout            = 60 * time.Second
+	remoteRequestTimeout             = 300 * time.Second
+	customRequestTimeoutKey          = customRequestTimeoutKeyType(struct{}{})
+	errorMissingOCISpec              = errors.New("Missing OCI specification")
+	defaultKataHostSharedDir         = "/run/kata-containers/shared/sandboxes/"
+	defaultKataGuestSharedDir        = "/run/kata-containers/shared/containers/"
+	defaultKataGuestNydusRootDir     = "/run/kata-containers/shared/"
+	defaultKataGuestVirtualVolumedir = "/run/kata-containers/virtual-volumes/"
+	mountGuestTag                    = "kataShared"
+	defaultKataGuestSandboxDir       = "/run/kata-containers/sandbox/"
+	type9pFs                         = "9p"
+	typeVirtioFS                     = "virtiofs"
+	typeOverlayFS                    = "overlay"
+	kata9pDevType                    = "9p"
+	kataMmioBlkDevType               = "mmioblk"
+	kataBlkDevType                   = "blk"
+	kataBlkCCWDevType                = "blk-ccw"
+	kataSCSIDevType                  = "scsi"
+	kataNvdimmDevType                = "nvdimm"
+	kataVirtioFSDevType              = "virtio-fs"
+	kataOverlayDevType               = "overlayfs"
+	kataWatchableBindDevType         = "watchable-bind"
+	kataVfioPciDevType               = "vfio-pci"     // VFIO PCI device to used as VFIO in the container
+	kataVfioPciGuestKernelDevType    = "vfio-pci-gk"  // VFIO PCI device for consumption by the guest kernel
+	kataVfioApDevType                = "vfio-ap"      // VFIO AP device for hot-plugging
+	kataVfioApColdDevType            = "vfio-ap-cold" // VFIO AP device for cold-plugging
+	sharedDir9pOptions               = []string{"trans=virtio,version=9p2000.L,cache=mmap", "nodev"}
+	sharedDirVirtioFSOptions         = []string{}
+	sharedDirVirtioFSDaxOptions      = "dax"
+	shmDir                           = "shm"
+	kataEphemeralDevType             = "ephemeral"
+	defaultEphemeralPath             = filepath.Join(defaultKataGuestSandboxDir, kataEphemeralDevType)
+	grpcMaxDataSize                  = int64(1024 * 1024)
+	localDirOptions                  = []string{"mode=0777"}
+	maxHostnameLen                   = 64
+	GuestDNSFile                     = "/etc/resolv.conf"
 )
 
 const (
-	agentTraceModeDynamic  = "dynamic"
-	agentTraceModeStatic   = "static"
-	agentTraceTypeIsolated = "isolated"
-	agentTraceTypeCollated = "collated"
-
-	defaultAgentTraceMode = agentTraceModeDynamic
-	defaultAgentTraceType = agentTraceTypeIsolated
-)
-
-const (
-	grpcCheckRequest             = "grpc.CheckRequest"
-	grpcExecProcessRequest       = "grpc.ExecProcessRequest"
-	grpcCreateSandboxRequest     = "grpc.CreateSandboxRequest"
-	grpcDestroySandboxRequest    = "grpc.DestroySandboxRequest"
-	grpcCreateContainerRequest   = "grpc.CreateContainerRequest"
-	grpcStartContainerRequest    = "grpc.StartContainerRequest"
-	grpcRemoveContainerRequest   = "grpc.RemoveContainerRequest"
-	grpcSignalProcessRequest     = "grpc.SignalProcessRequest"
-	grpcUpdateRoutesRequest      = "grpc.UpdateRoutesRequest"
-	grpcUpdateInterfaceRequest   = "grpc.UpdateInterfaceRequest"
-	grpcListInterfacesRequest    = "grpc.ListInterfacesRequest"
-	grpcListRoutesRequest        = "grpc.ListRoutesRequest"
-	grpcAddARPNeighborsRequest   = "grpc.AddARPNeighborsRequest"
-	grpcOnlineCPUMemRequest      = "grpc.OnlineCPUMemRequest"
-	grpcUpdateContainerRequest   = "grpc.UpdateContainerRequest"
-	grpcWaitProcessRequest       = "grpc.WaitProcessRequest"
-	grpcTtyWinResizeRequest      = "grpc.TtyWinResizeRequest"
-	grpcWriteStreamRequest       = "grpc.WriteStreamRequest"
-	grpcCloseStdinRequest        = "grpc.CloseStdinRequest"
-	grpcStatsContainerRequest    = "grpc.StatsContainerRequest"
-	grpcPauseContainerRequest    = "grpc.PauseContainerRequest"
-	grpcResumeContainerRequest   = "grpc.ResumeContainerRequest"
-	grpcReseedRandomDevRequest   = "grpc.ReseedRandomDevRequest"
-	grpcGuestDetailsRequest      = "grpc.GuestDetailsRequest"
-	grpcMemHotplugByProbeRequest = "grpc.MemHotplugByProbeRequest"
-	grpcCopyFileRequest          = "grpc.CopyFileRequest"
-	grpcSetGuestDateTimeRequest  = "grpc.SetGuestDateTimeRequest"
-	grpcStartTracingRequest      = "grpc.StartTracingRequest"
-	grpcStopTracingRequest       = "grpc.StopTracingRequest"
-	grpcGetOOMEventRequest       = "grpc.GetOOMEventRequest"
-	grpcGetMetricsRequest        = "grpc.GetMetricsRequest"
-	grpcAddSwapRequest           = "grpc.AddSwapRequest"
+	grpcCheckRequest                          = "grpc.CheckRequest"
+	grpcExecProcessRequest                    = "grpc.ExecProcessRequest"
+	grpcCreateSandboxRequest                  = "grpc.CreateSandboxRequest"
+	grpcDestroySandboxRequest                 = "grpc.DestroySandboxRequest"
+	grpcCreateContainerRequest                = "grpc.CreateContainerRequest"
+	grpcStartContainerRequest                 = "grpc.StartContainerRequest"
+	grpcRemoveContainerRequest                = "grpc.RemoveContainerRequest"
+	grpcSignalProcessRequest                  = "grpc.SignalProcessRequest"
+	grpcUpdateRoutesRequest                   = "grpc.UpdateRoutesRequest"
+	grpcUpdateInterfaceRequest                = "grpc.UpdateInterfaceRequest"
+	grpcUpdateEphemeralMountsRequest          = "grpc.UpdateEphemeralMountsRequest"
+	grpcRemoveStaleVirtiofsShareMountsRequest = "grpc.RemoveStaleVirtiofsShareMountsRequest"
+	grpcListInterfacesRequest                 = "grpc.ListInterfacesRequest"
+	grpcListRoutesRequest                     = "grpc.ListRoutesRequest"
+	grpcAddARPNeighborsRequest                = "grpc.AddARPNeighborsRequest"
+	grpcOnlineCPUMemRequest                   = "grpc.OnlineCPUMemRequest"
+	grpcUpdateContainerRequest                = "grpc.UpdateContainerRequest"
+	grpcWaitProcessRequest                    = "grpc.WaitProcessRequest"
+	grpcTtyWinResizeRequest                   = "grpc.TtyWinResizeRequest"
+	grpcWriteStreamRequest                    = "grpc.WriteStreamRequest"
+	grpcCloseStdinRequest                     = "grpc.CloseStdinRequest"
+	grpcStatsContainerRequest                 = "grpc.StatsContainerRequest"
+	grpcPauseContainerRequest                 = "grpc.PauseContainerRequest"
+	grpcResumeContainerRequest                = "grpc.ResumeContainerRequest"
+	grpcReseedRandomDevRequest                = "grpc.ReseedRandomDevRequest"
+	grpcGuestDetailsRequest                   = "grpc.GuestDetailsRequest"
+	grpcMemHotplugByProbeRequest              = "grpc.MemHotplugByProbeRequest"
+	grpcCopyFileRequest                       = "grpc.CopyFileRequest"
+	grpcSetGuestDateTimeRequest               = "grpc.SetGuestDateTimeRequest"
+	grpcGetOOMEventRequest                    = "grpc.GetOOMEventRequest"
+	grpcGetMetricsRequest                     = "grpc.GetMetricsRequest"
+	grpcAddSwapRequest                        = "grpc.AddSwapRequest"
+	grpcVolumeStatsRequest                    = "grpc.VolumeStatsRequest"
+	grpcResizeVolumeRequest                   = "grpc.ResizeVolumeRequest"
+	grpcGetIPTablesRequest                    = "grpc.GetIPTablesRequest"
+	grpcSetIPTablesRequest                    = "grpc.SetIPTablesRequest"
+	grpcSetPolicyRequest                      = "grpc.SetPolicyRequest"
 )
 
 // newKataAgent returns an agent from an agent type.
@@ -160,6 +178,25 @@ var kataHostSharedDir = func() string {
 	return defaultKataHostSharedDir
 }
 
+func getPagesizeFromOpt(fsOpts []string) string {
+	// example options array: "rw", "relatime", "seclabel", "pagesize=2M"
+	for _, opt := range fsOpts {
+		if strings.HasPrefix(opt, "pagesize=") {
+			return strings.TrimPrefix(opt, "pagesize=")
+		}
+	}
+	return ""
+}
+
+func getFSGroupChangePolicy(policy volume.FSGroupChangePolicy) pbTypes.FSGroupChangePolicy {
+	switch policy {
+	case volume.FSGroupChangeOnRootMismatch:
+		return pbTypes.FSGroupChangePolicy_OnRootMismatch
+	default:
+		return pbTypes.FSGroupChangePolicy_Always
+	}
+}
+
 // Shared path handling:
 // 1. create three directories for each sandbox:
 // -. /run/kata-containers/shared/sandboxes/$sbx_id/mounts/, a directory to hold all host/guest shared mounts
@@ -169,7 +206,7 @@ var kataHostSharedDir = func() string {
 // 2. /run/kata-containers/shared/sandboxes/$sbx_id/mounts/ is bind mounted readonly to /run/kata-containers/shared/sandboxes/$sbx_id/shared/, so guest cannot modify it
 //
 // 3. host-guest shared files/directories are mounted one-level under /run/kata-containers/shared/sandboxes/$sbx_id/mounts/ and thus present to guest at one level under /run/kata-containers/shared/sandboxes/$sbx_id/shared/
-func getSharePath(id string) string {
+func GetSharePath(id string) string {
 	return filepath.Join(kataHostSharedDir(), id, "shared")
 }
 
@@ -183,6 +220,32 @@ func getPrivatePath(id string) string {
 
 func getSandboxPath(id string) string {
 	return filepath.Join(kataHostSharedDir(), id)
+}
+
+// Use in nydus case, guest shared dir is compatible with virtiofsd sharedir
+// nydus images are presented in kataGuestNydusImageDir
+//
+// virtiofs mountpoint: "/run/kata-containers/shared/"
+// kataGuestSharedDir: "/run/kata-containers/shared/containers"
+// kataGuestNydusImageDir: "/run/kata-containers/shared/rafs"
+var kataGuestNydusRootDir = func() string {
+	if rootless.IsRootless() {
+		// filepath.Join removes trailing slashes, but it is necessary for mounting
+		return filepath.Join(rootless.GetRootlessDir(), defaultKataGuestNydusRootDir) + "/"
+	}
+	return defaultKataGuestNydusRootDir
+}
+
+var rafsMountPath = func(cid string) string {
+	return filepath.Join("/", nydusRafs, cid, lowerDir)
+}
+
+var kataGuestNydusImageDir = func() string {
+	if rootless.IsRootless() {
+		// filepath.Join removes trailing slashes, but it is necessary for mounting
+		return filepath.Join(rootless.GetRootlessDir(), defaultKataGuestNydusRootDir, nydusRafs) + "/"
+	}
+	return filepath.Join(defaultKataGuestNydusRootDir, nydusRafs) + "/"
 }
 
 // The function is declared this way for mocking in unit tests
@@ -217,15 +280,15 @@ func ephemeralPath() string {
 // KataAgentConfig is a structure storing information needed
 // to reach the Kata Containers agent.
 type KataAgentConfig struct {
-	TraceMode          string
-	TraceType          string
 	KernelModules      []string
 	ContainerPipeSize  uint32
 	DialTimeout        uint32
+	CdhApiTimeout      uint32
 	LongLiveConn       bool
 	Debug              bool
 	Trace              bool
 	EnableDebugConsole bool
+	Policy             string
 }
 
 // KataAgentState is the structure describing the data stored from this
@@ -251,9 +314,8 @@ type kataAgent struct {
 
 	dialTimout uint32
 
-	keepConn       bool
-	dynamicTracing bool
-	dead           bool
+	keepConn bool
+	dead     bool
 }
 
 func (k *kataAgent) Logger() *logrus.Entry {
@@ -262,34 +324,6 @@ func (k *kataAgent) Logger() *logrus.Entry {
 
 func (k *kataAgent) longLiveConn() bool {
 	return k.keepConn
-}
-
-// KataAgentSetDefaultTraceConfigOptions validates agent trace options and
-// sets defaults.
-func KataAgentSetDefaultTraceConfigOptions(config *KataAgentConfig) error {
-	if !config.Trace {
-		return nil
-	}
-
-	switch config.TraceMode {
-	case agentTraceModeDynamic:
-	case agentTraceModeStatic:
-	case "":
-		config.TraceMode = defaultAgentTraceMode
-	default:
-		return fmt.Errorf("invalid kata agent trace mode: %q (need %q or %q)", config.TraceMode, agentTraceModeDynamic, agentTraceModeStatic)
-	}
-
-	switch config.TraceType {
-	case agentTraceTypeIsolated:
-	case agentTraceTypeCollated:
-	case "":
-		config.TraceType = defaultAgentTraceType
-	default:
-		return fmt.Errorf("invalid kata agent trace type: %q (need %q or %q)", config.TraceType, agentTraceTypeIsolated, agentTraceTypeCollated)
-	}
-
-	return nil
 }
 
 // KataAgentKernelParams returns a list of Kata Agent specific kernel
@@ -301,8 +335,8 @@ func KataAgentKernelParams(config KataAgentConfig) []Param {
 		params = append(params, Param{Key: "agent.log", Value: "debug"})
 	}
 
-	if config.Trace && config.TraceMode == agentTraceModeStatic {
-		params = append(params, Param{Key: "agent.trace", Value: config.TraceType})
+	if config.Trace {
+		params = append(params, Param{Key: "agent.trace", Value: "true"})
 	}
 
 	if config.ContainerPipeSize > 0 {
@@ -315,28 +349,30 @@ func KataAgentKernelParams(config KataAgentConfig) []Param {
 		params = append(params, Param{Key: kernelParamDebugConsoleVPort, Value: kernelParamDebugConsoleVPortValue})
 	}
 
+	if config.CdhApiTimeout > 0 {
+		cdhApiTimeout := strconv.FormatUint(uint64(config.CdhApiTimeout), 10)
+		params = append(params, Param{Key: vcAnnotations.CdhApiTimeoutKernelParam, Value: cdhApiTimeout})
+	}
+
 	return params
 }
 
 func (k *kataAgent) handleTraceSettings(config KataAgentConfig) bool {
-	if !config.Trace {
-		return false
-	}
-
 	disableVMShutdown := false
 
-	switch config.TraceMode {
-	case agentTraceModeStatic:
+	if config.Trace {
+		// Agent tracing requires that the agent be able to shutdown
+		// cleanly. This is the only scenario where the agent is
+		// responsible for stopping the VM: normally this is handled
+		// by the runtime.
 		disableVMShutdown = true
-	case agentTraceModeDynamic:
-		k.dynamicTracing = true
 	}
 
 	return disableVMShutdown
 }
 
 func (k *kataAgent) init(ctx context.Context, sandbox *Sandbox, config KataAgentConfig) (disableVMShutdown bool, err error) {
-	// save
+	// Save
 	k.ctx = sandbox.ctx
 
 	span, _ := katatrace.Trace(ctx, k.Logger(), "init", kataAgentTracingTags)
@@ -347,6 +383,11 @@ func (k *kataAgent) init(ctx context.Context, sandbox *Sandbox, config KataAgent
 	k.kmodules = config.KernelModules
 	k.dialTimout = config.DialTimeout
 
+	createContainerRequestTimeout = time.Duration(sandbox.config.CreateContainerTimeout) * time.Second
+	k.Logger().WithFields(logrus.Fields{
+		"createContainerRequestTimeout": fmt.Sprintf("%+v", createContainerRequestTimeout),
+	}).Info("The createContainerRequestTimeout has been set ")
+
 	return disableVMShutdown, nil
 }
 
@@ -355,6 +396,8 @@ func (k *kataAgent) agentURL() (string, error) {
 	case types.VSock:
 		return s.String(), nil
 	case types.HybridVSock:
+		return s.String(), nil
+	case types.RemoteSock:
 		return s.String(), nil
 	case types.MockHybridVSock:
 		return s.String(), nil
@@ -366,101 +409,28 @@ func (k *kataAgent) agentURL() (string, error) {
 func (k *kataAgent) capabilities() types.Capabilities {
 	var caps types.Capabilities
 
-	// add all capabilities supported by agent
+	// add all Capabilities supported by agent
 	caps.SetBlockDeviceSupport()
 
 	return caps
 }
 
-func (k *kataAgent) internalConfigure(ctx context.Context, h hypervisor, id string, config KataAgentConfig) error {
+func (k *kataAgent) internalConfigure(ctx context.Context, h Hypervisor, id string, config KataAgentConfig) error {
 	span, _ := katatrace.Trace(ctx, k.Logger(), "configure", kataAgentTracingTags)
 	defer span.End()
 
 	var err error
-	if k.vmSocket, err = h.generateSocket(id); err != nil {
+	if k.vmSocket, err = h.GenerateSocket(id); err != nil {
 		return err
 	}
 	k.keepConn = config.LongLiveConn
 
-	katatrace.AddTag(span, "socket", k.vmSocket)
+	katatrace.AddTags(span, "socket", k.vmSocket)
 
 	return nil
 }
 
-func (k *kataAgent) setupSandboxBindMounts(ctx context.Context, sandbox *Sandbox) (err error) {
-	span, ctx := katatrace.Trace(ctx, k.Logger(), "setupSandboxBindMounts", kataAgentTracingTags)
-	defer span.End()
-
-	if len(sandbox.config.SandboxBindMounts) == 0 {
-		return nil
-	}
-
-	// Create subdirectory in host shared path for sandbox mounts
-	sandboxMountDir := filepath.Join(getMountPath(sandbox.id), sandboxMountsDir)
-	sandboxShareDir := filepath.Join(getSharePath(sandbox.id), sandboxMountsDir)
-	if err := os.MkdirAll(sandboxMountDir, DirMode); err != nil {
-		return fmt.Errorf("Creating sandbox shared mount directory: %v: %w", sandboxMountDir, err)
-	}
-	var mountedList []string
-	defer func() {
-		if err != nil {
-			for _, mnt := range mountedList {
-				if derr := syscall.Unmount(mnt, syscall.MNT_DETACH|UmountNoFollow); derr != nil {
-					k.Logger().WithError(derr).Errorf("cleanup: couldn't unmount %s", mnt)
-				}
-			}
-			if derr := os.RemoveAll(sandboxMountDir); derr != nil {
-				k.Logger().WithError(derr).Errorf("cleanup: failed to remove %s", sandboxMountDir)
-			}
-
-		}
-	}()
-
-	for _, m := range sandbox.config.SandboxBindMounts {
-		mountDest := filepath.Join(sandboxMountDir, filepath.Base(m))
-		// bind-mount each sandbox mount that's defined into the sandbox mounts dir
-		if err := bindMount(ctx, m, mountDest, true, "private"); err != nil {
-			return fmt.Errorf("Mounting sandbox directory: %v to %v: %w", m, mountDest, err)
-		}
-		mountedList = append(mountedList, mountDest)
-
-		mountDest = filepath.Join(sandboxShareDir, filepath.Base(m))
-		if err := remountRo(ctx, mountDest); err != nil {
-			return fmt.Errorf("remount sandbox directory: %v to %v: %w", m, mountDest, err)
-		}
-
-	}
-
-	return nil
-}
-
-func (k *kataAgent) cleanupSandboxBindMounts(sandbox *Sandbox) error {
-	if sandbox.config == nil || len(sandbox.config.SandboxBindMounts) == 0 {
-		return nil
-	}
-
-	var retErr error
-	bindmountShareDir := filepath.Join(getMountPath(sandbox.id), sandboxMountsDir)
-	for _, m := range sandbox.config.SandboxBindMounts {
-		mountPath := filepath.Join(bindmountShareDir, filepath.Base(m))
-		if err := syscall.Unmount(mountPath, syscall.MNT_DETACH|UmountNoFollow); err != nil {
-			if retErr == nil {
-				retErr = err
-			}
-			k.Logger().WithError(err).Errorf("Failed to unmount sandbox bindmount: %v", mountPath)
-		}
-	}
-	if err := os.RemoveAll(bindmountShareDir); err != nil {
-		if retErr == nil {
-			retErr = err
-		}
-		k.Logger().WithError(err).Errorf("Failed to remove sandbox bindmount directory: %s", bindmountShareDir)
-	}
-
-	return retErr
-}
-
-func (k *kataAgent) configure(ctx context.Context, h hypervisor, id, sharePath string, config KataAgentConfig) error {
+func (k *kataAgent) configure(ctx context.Context, h Hypervisor, id, sharePath string, config KataAgentConfig) error {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "configure", kataAgentTracingTags)
 	defer span.End()
 
@@ -471,22 +441,23 @@ func (k *kataAgent) configure(ctx context.Context, h hypervisor, id, sharePath s
 
 	switch s := k.vmSocket.(type) {
 	case types.VSock:
-		if err = h.addDevice(ctx, s, vSockPCIDev); err != nil {
+		if err = h.AddDevice(ctx, s, VSockPCIDev); err != nil {
 			return err
 		}
 	case types.HybridVSock:
-		err = h.addDevice(ctx, s, hybridVirtioVsockDev)
+		err = h.AddDevice(ctx, s, HybridVirtioVsockDev)
 		if err != nil {
 			return err
 		}
+	case types.RemoteSock:
 	case types.MockHybridVSock:
 	default:
-		return vcTypes.ErrInvalidConfigType
+		return types.ErrInvalidConfigType
 	}
 
 	// Neither create shared directory nor add 9p device if hypervisor
 	// doesn't support filesystem sharing.
-	caps := h.capabilities(ctx)
+	caps := h.Capabilities(ctx)
 	if !caps.IsFsSharingSupported() {
 		return nil
 	}
@@ -502,55 +473,18 @@ func (k *kataAgent) configure(ctx context.Context, h hypervisor, id, sharePath s
 		return err
 	}
 
-	return h.addDevice(ctx, sharedVolume, fsDev)
+	return h.AddDevice(ctx, sharedVolume, FsDev)
 }
 
-func (k *kataAgent) configureFromGrpc(ctx context.Context, h hypervisor, id string, config KataAgentConfig) error {
+func (k *kataAgent) configureFromGrpc(ctx context.Context, h Hypervisor, id string, config KataAgentConfig) error {
 	return k.internalConfigure(ctx, h, id, config)
-}
-
-func (k *kataAgent) setupSharedPath(ctx context.Context, sandbox *Sandbox) (err error) {
-	span, ctx := katatrace.Trace(ctx, k.Logger(), "setupSharedPath", kataAgentTracingTags)
-	defer span.End()
-
-	// create shared path structure
-	sharePath := getSharePath(sandbox.id)
-	mountPath := getMountPath(sandbox.id)
-	if err := os.MkdirAll(sharePath, DirMode); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(mountPath, DirMode); err != nil {
-		return err
-	}
-
-	// slave mount so that future mountpoints under mountPath are shown in sharePath as well
-	if err := bindMount(ctx, mountPath, sharePath, true, "slave"); err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			if umountErr := syscall.Unmount(sharePath, syscall.MNT_DETACH|UmountNoFollow); umountErr != nil {
-				k.Logger().WithError(umountErr).Errorf("failed to unmount vm share path %s", sharePath)
-			}
-		}
-	}()
-
-	// Setup sandbox bindmounts, if specified:
-	if err = k.setupSandboxBindMounts(ctx, sandbox); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (k *kataAgent) createSandbox(ctx context.Context, sandbox *Sandbox) error {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "createSandbox", kataAgentTracingTags)
 	defer span.End()
 
-	if err := k.setupSharedPath(ctx, sandbox); err != nil {
-		return err
-	}
-	return k.configure(ctx, sandbox.hypervisor, sandbox.id, getSharePath(sandbox.id), sandbox.config.AgentConfig)
+	return k.configure(ctx, sandbox.hypervisor, sandbox.id, GetSharePath(sandbox.id), sandbox.config.AgentConfig)
 }
 
 func cmdToKataProcess(cmd types.Cmd) (process *grpc.Process, err error) {
@@ -606,7 +540,7 @@ func cmdToKataProcess(cmd types.Cmd) (process *grpc.Process, err error) {
 
 	process = &grpc.Process{
 		Terminal: cmd.Interactive,
-		User: grpc.User{
+		User: &grpc.User{
 			UID:            uid,
 			GID:            gid,
 			AdditionalGids: extraGids,
@@ -648,6 +582,9 @@ func (k *kataAgent) exec(ctx context.Context, sandbox *Sandbox, c Container, cmd
 	}
 
 	if _, err := k.sendReq(ctx, req); err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "ExecProcessRequest timed out")
+		}
 		return nil, err
 	}
 
@@ -665,6 +602,9 @@ func (k *kataAgent) updateInterface(ctx context.Context, ifc *pbTypes.Interface)
 			"interface-requested": fmt.Sprintf("%+v", ifc),
 			"resulting-interface": fmt.Sprintf("%+v", resultingInterface),
 		}).WithError(err).Error("update interface request failed")
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "UpdateInterfaceRequest timed out")
+		}
 	}
 	if resultInterface, ok := resultingInterface.(*pbTypes.Interface); ok {
 		return resultInterface, err
@@ -694,6 +634,9 @@ func (k *kataAgent) updateRoutes(ctx context.Context, routes []*pbTypes.Route) (
 				"routes-requested": fmt.Sprintf("%+v", routes),
 				"resulting-routes": fmt.Sprintf("%+v", resultingRoutes),
 			}).WithError(err).Error("update routes request failed")
+			if err.Error() == context.DeadlineExceeded.Error() {
+				return nil, status.Errorf(codes.DeadlineExceeded, "UpdateRoutesRequest timed out")
+			}
 		}
 		resultRoutes, ok := resultingRoutes.(*grpc.Routes)
 		if ok && resultRoutes != nil {
@@ -702,6 +645,24 @@ func (k *kataAgent) updateRoutes(ctx context.Context, routes []*pbTypes.Route) (
 		return nil, err
 	}
 	return nil, nil
+}
+
+func (k *kataAgent) updateEphemeralMounts(ctx context.Context, storages []*grpc.Storage) error {
+	if storages != nil {
+		storagesReq := &grpc.UpdateEphemeralMountsRequest{
+			Storages: storages,
+		}
+
+		if _, err := k.sendReq(ctx, storagesReq); err != nil {
+			k.Logger().WithError(err).Error("update mounts request failed")
+			if err.Error() == context.DeadlineExceeded.Error() {
+				return status.Errorf(codes.DeadlineExceeded, "UpdateEphemeralMountsRequest timed out")
+			}
+			return err
+		}
+		return nil
+	}
+	return nil
 }
 
 func (k *kataAgent) addARPNeighbors(ctx context.Context, neighs []*pbTypes.ARPNeighbor) error {
@@ -719,6 +680,9 @@ func (k *kataAgent) addARPNeighbors(ctx context.Context, neighs []*pbTypes.ARPNe
 				}).Warn("add ARP neighbors request failed due to old agent, please upgrade Kata Containers image version")
 				return nil
 			}
+			if err.Error() == context.DeadlineExceeded.Error() {
+				return status.Errorf(codes.DeadlineExceeded, "AddARPNeighborsRequest timed out")
+			}
 			k.Logger().WithFields(logrus.Fields{
 				"arpneighbors-requested": fmt.Sprintf("%+v", neighs),
 			}).WithError(err).Error("add ARP neighbors request failed")
@@ -732,6 +696,9 @@ func (k *kataAgent) listInterfaces(ctx context.Context) ([]*pbTypes.Interface, e
 	req := &grpc.ListInterfacesRequest{}
 	resultingInterfaces, err := k.sendReq(ctx, req)
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "ListInterfacesRequest timed out")
+		}
 		return nil, err
 	}
 	resultInterfaces, ok := resultingInterfaces.(*grpc.Interfaces)
@@ -745,6 +712,9 @@ func (k *kataAgent) listRoutes(ctx context.Context) ([]*pbTypes.Route, error) {
 	req := &grpc.ListRoutesRequest{}
 	resultingRoutes, err := k.sendReq(ctx, req)
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "ListRoutesRequest timed out")
+		}
 		return nil, err
 	}
 	resultRoutes, ok := resultingRoutes.(*grpc.Routes)
@@ -789,7 +759,7 @@ func (k *kataAgent) getDNS(sandbox *Sandbox) ([]string, error) {
 
 	for _, m := range ociMounts {
 		if m.Destination == GuestDNSFile {
-			content, err := ioutil.ReadFile(m.Source)
+			content, err := os.ReadFile(m.Source)
 			if err != nil {
 				return nil, fmt.Errorf("Could not read file %s: %s", m.Source, err)
 			}
@@ -803,7 +773,7 @@ func (k *kataAgent) getDNS(sandbox *Sandbox) ([]string, error) {
 }
 
 func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
-	span, ctx := katatrace.Trace(ctx, k.Logger(), "startSandbox", kataAgentTracingTags)
+	span, ctx := katatrace.Trace(ctx, k.Logger(), "StartVM", kataAgentTracingTags)
 	defer span.End()
 
 	if err := k.setAgentURL(); err != nil {
@@ -820,29 +790,34 @@ func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 		return err
 	}
 
-	// check grpc server is serving
+	var kmodules []*grpc.KernelModule
+
+	if sandbox.config.HypervisorType == RemoteHypervisor {
+		ctx = context.WithValue(ctx, customRequestTimeoutKey, remoteRequestTimeout)
+	}
+
+	// Check grpc server is serving
 	if err = k.check(ctx); err != nil {
 		return err
 	}
 
-	// Setup network interfaces and routes
-	interfaces, routes, neighs, err := generateVCNetworkStructures(ctx, sandbox.networkNS)
-	if err != nil {
-		return err
+	// If a Policy has been specified, send it to the agent.
+	if len(sandbox.config.AgentConfig.Policy) > 0 {
+		if err := sandbox.agent.setPolicy(ctx, sandbox.config.AgentConfig.Policy); err != nil {
+			return err
+		}
 	}
-	if err = k.updateInterfaces(ctx, interfaces); err != nil {
-		return err
-	}
-	if _, err = k.updateRoutes(ctx, routes); err != nil {
-		return err
-	}
-	if err = k.addARPNeighbors(ctx, neighs); err != nil {
-		return err
+
+	if sandbox.config.HypervisorType != RemoteHypervisor {
+		// Setup network interfaces and routes
+		err = k.setupNetworks(ctx, sandbox, nil)
+		if err != nil {
+			return err
+		}
+		kmodules = setupKernelModules(k.kmodules)
 	}
 
 	storages := setupStorages(ctx, sandbox)
-
-	kmodules := setupKernelModules(k.kmodules)
 
 	req := &grpc.CreateSandboxRequest{
 		Hostname:      hostname,
@@ -856,14 +831,10 @@ func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
 
 	_, err = k.sendReq(ctx, req)
 	if err != nil {
-		return err
-	}
-
-	if k.dynamicTracing {
-		_, err = k.sendReq(ctx, &grpc.StartTracingRequest{})
-		if err != nil {
-			return err
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "CreateSandboxRequest timed out")
 		}
+		return err
 	}
 
 	return nil
@@ -892,7 +863,7 @@ func setupKernelModules(kmodules []string) []*grpc.KernelModule {
 
 func setupStorages(ctx context.Context, sandbox *Sandbox) []*grpc.Storage {
 	storages := []*grpc.Storage{}
-	caps := sandbox.hypervisor.capabilities(ctx)
+	caps := sandbox.hypervisor.Capabilities(ctx)
 
 	// append 9p shared volume to storages only if filesystem sharing is supported
 	if caps.IsFsSharingSupported() {
@@ -901,22 +872,27 @@ func setupStorages(ctx context.Context, sandbox *Sandbox) []*grpc.Storage {
 		// This is where at least some of the host config files
 		// (resolv.conf, etc...) and potentially all container
 		// rootfs will reside.
-		if sandbox.config.HypervisorConfig.SharedFS == config.VirtioFS {
+		sharedFS := sandbox.config.HypervisorConfig.SharedFS
+		if sharedFS == config.VirtioFS || sharedFS == config.VirtioFSNydus {
 			// If virtio-fs uses either of the two cache options 'auto, always',
 			// the guest directory can be mounted with option 'dax' allowing it to
-			// directly map contents from the host. When set to 'none', the mount
+			// directly map contents from the host. When set to 'never', the mount
 			// options should not contain 'dax' lest the virtio-fs daemon crashing
 			// with an invalid address reference.
-			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSNoCache {
+			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeNever {
 				// If virtio_fs_cache_size = 0, dax should not be used.
 				if sandbox.config.HypervisorConfig.VirtioFSCacheSize != 0 {
 					sharedDirVirtioFSOptions = append(sharedDirVirtioFSOptions, sharedDirVirtioFSDaxOptions)
 				}
 			}
+			mountPoint := kataGuestSharedDir()
+			if sharedFS == config.VirtioFSNydus {
+				mountPoint = kataGuestNydusRootDir()
+			}
 			sharedVolume := &grpc.Storage{
 				Driver:     kataVirtioFSDevType,
 				Source:     mountGuestTag,
-				MountPoint: kataGuestSharedDir(),
+				MountPoint: mountPoint,
 				Fstype:     typeVirtioFS,
 				Options:    sharedDirVirtioFSOptions,
 			}
@@ -962,14 +938,10 @@ func (k *kataAgent) stopSandbox(ctx context.Context, sandbox *Sandbox) error {
 	req := &grpc.DestroySandboxRequest{}
 
 	if _, err := k.sendReq(ctx, req); err != nil {
-		return err
-	}
-
-	if k.dynamicTracing {
-		_, err := k.sendReq(ctx, &grpc.StopTracingRequest{})
-		if err != nil {
-			return err
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "DestroySandboxRequest timed out")
 		}
+		return err
 	}
 
 	return nil
@@ -994,6 +966,8 @@ func (k *kataAgent) removeIgnoredOCIMount(spec *specs.Spec, ignoredMounts map[st
 	for _, m := range spec.Mounts {
 		if _, found := ignoredMounts[m.Source]; found {
 			k.Logger().WithField("removed-mount", m.Source).Debug("Removing OCI mount")
+		} else if HasOption(m.Options, vcAnnotations.IsFileSystemLayer) {
+			k.Logger().WithField("removed-mount", m.Source).Debug("Removing layer")
 		} else {
 			mounts = append(mounts, m)
 		}
@@ -1005,36 +979,7 @@ func (k *kataAgent) removeIgnoredOCIMount(spec *specs.Spec, ignoredMounts map[st
 	return nil
 }
 
-func (k *kataAgent) replaceOCIMountsForStorages(spec *specs.Spec, volumeStorages []*grpc.Storage) error {
-	ociMounts := spec.Mounts
-	var index int
-	var m specs.Mount
-
-	for i, v := range volumeStorages {
-		for index, m = range ociMounts {
-			if m.Destination != v.MountPoint {
-				continue
-			}
-
-			// Create a temporary location to mount the Storage. Mounting to the correct location
-			// will be handled by the OCI mount structure.
-			filename := fmt.Sprintf("%s-%s", uuid.Generate().String(), filepath.Base(m.Destination))
-			path := filepath.Join(kataGuestSandboxStorageDir(), filename)
-
-			k.Logger().Debugf("Replacing OCI mount source (%s) with %s", m.Source, path)
-			ociMounts[index].Source = path
-			volumeStorages[i].MountPoint = path
-
-			break
-		}
-		if index == len(ociMounts) {
-			return fmt.Errorf("OCI mount not found for block volume %s", v.MountPoint)
-		}
-	}
-	return nil
-}
-
-func (k *kataAgent) constraintGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool) {
+func (k *kataAgent) constrainGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool, disableGuestSeLinux bool, guestSeLinuxLabel string, stripVfio bool) error {
 	// Disable Hooks since they have been handled on the host and there is
 	// no reason to send them to the agent. It would make no sense to try
 	// to apply them on the guest.
@@ -1046,11 +991,34 @@ func (k *kataAgent) constraintGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool) {
 		grpcSpec.Linux.Seccomp = nil
 	}
 
-	// Disable SELinux inside of the virtual machine, the label will apply
-	// to the KVM process
+	// Pass SELinux label for the container process to the agent.
 	if grpcSpec.Process.SelinuxLabel != "" {
-		k.Logger().Info("SELinux label from config will be applied to the hypervisor process, not the VM workload")
-		grpcSpec.Process.SelinuxLabel = ""
+		if !disableGuestSeLinux {
+			k.Logger().Info("SELinux label will be applied to the container process inside guest")
+
+			var label string
+			if guestSeLinuxLabel != "" {
+				label = guestSeLinuxLabel
+			} else {
+				label = grpcSpec.Process.SelinuxLabel
+			}
+
+			processContext, err := selinux.NewContext(label)
+			if err != nil {
+				return err
+			}
+
+			// Change the type from KVM to container because the type passed from the high-level
+			// runtime is for KVM process.
+			if guestSeLinuxLabel == "" {
+				processContext["type"] = defaultSeLinuxContainerType
+			}
+			grpcSpec.Process.SelinuxLabel = processContext.Get()
+		} else {
+			k.Logger().Info("Empty SELinux label for the process and the mount because guest SELinux is disabled")
+			grpcSpec.Process.SelinuxLabel = ""
+			grpcSpec.Linux.MountLabel = ""
+		}
 	}
 
 	// By now only CPU constraints are supported
@@ -1059,25 +1027,25 @@ func (k *kataAgent) constraintGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool) {
 	grpcSpec.Linux.Resources.Devices = nil
 	grpcSpec.Linux.Resources.Pids = nil
 	grpcSpec.Linux.Resources.BlockIO = nil
-	grpcSpec.Linux.Resources.HugepageLimits = nil
 	grpcSpec.Linux.Resources.Network = nil
 	if grpcSpec.Linux.Resources.CPU != nil {
 		grpcSpec.Linux.Resources.CPU.Cpus = ""
 		grpcSpec.Linux.Resources.CPU.Mems = ""
 	}
 
+	// We need agent systemd cgroup now.
 	// There are three main reasons to do not apply systemd cgroups in the VM
 	// - Initrd image doesn't have systemd.
 	// - Nobody will be able to modify the resources of a specific container by using systemctl set-property.
 	// - docker is not running in the VM.
-	if vccgroups.IsSystemdCgroup(grpcSpec.Linux.CgroupsPath) {
-		// Convert systemd cgroup to cgroupfs
-		slice := strings.Split(grpcSpec.Linux.CgroupsPath, ":")
-		// 0 - slice: system.slice
-		// 1 - prefix: docker
-		// 2 - name: abc123
-		grpcSpec.Linux.CgroupsPath = filepath.Join("/", slice[1], slice[2])
-	}
+	// if resCtrl.IsSystemdCgroup(grpcSpec.Linux.CgroupsPath) {
+	// 	// Convert systemd cgroup to cgroupfs
+	// 	slice := strings.Split(grpcSpec.Linux.CgroupsPath, ":")
+	// 	// 0 - slice: system.slice
+	// 	// 1 - prefix: docker
+	// 	// 2 - name: abc123
+	// 	grpcSpec.Linux.CgroupsPath = filepath.Join("/", slice[1], slice[2])
+	// }
 
 	// Disable network namespace since it is already handled on the host by
 	// virtcontainers. The network is a complex part which cannot be simply
@@ -1085,7 +1053,7 @@ func (k *kataAgent) constraintGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool) {
 	// Every other namespaces's paths have to be emptied. This way, there
 	// is no confusion from the agent, trying to find an existing namespace
 	// on the guest.
-	var tmpNamespaces []grpc.LinuxNamespace
+	var tmpNamespaces []*grpc.LinuxNamespace
 	for _, ns := range grpcSpec.Linux.Namespaces {
 		switch ns.Type {
 		case string(specs.CgroupNamespace):
@@ -1097,17 +1065,23 @@ func (k *kataAgent) constraintGRPCSpec(grpcSpec *grpc.Spec, passSeccomp bool) {
 	}
 	grpcSpec.Linux.Namespaces = tmpNamespaces
 
-	// VFIO char device shouldn't not appear in the guest,
-	// the device driver should handle it and determinate its group.
-	var linuxDevices []grpc.LinuxDevice
-	for _, dev := range grpcSpec.Linux.Devices {
-		if dev.Type == "c" && strings.HasPrefix(dev.Path, vfioPath) {
-			k.Logger().WithField("vfio-dev", dev.Path).Debug("removing vfio device from grpcSpec")
-			continue
+	if stripVfio {
+		// VFIO char device shouldn't appear in the guest
+		// (because the VM device driver will do something
+		// with it rather than just presenting it to the
+		// container unmodified)
+		var linuxDevices []*grpc.LinuxDevice
+		for _, dev := range grpcSpec.Linux.Devices {
+			if dev.Type == "c" && strings.HasPrefix(dev.Path, vfioPath) {
+				k.Logger().WithField("vfio-dev", dev.Path).Debug("removing vfio device from grpcSpec")
+				continue
+			}
+			linuxDevices = append(linuxDevices, dev)
 		}
-		linuxDevices = append(linuxDevices, dev)
+		grpcSpec.Linux.Devices = linuxDevices
 	}
-	grpcSpec.Linux.Devices = linuxDevices
+
+	return nil
 }
 
 func (k *kataAgent) handleShm(mounts []specs.Mount, sandbox *Sandbox) {
@@ -1141,9 +1115,7 @@ func (k *kataAgent) handleShm(mounts []specs.Mount, sandbox *Sandbox) {
 	}
 }
 
-func (k *kataAgent) appendBlockDevice(dev ContainerDevice, c *Container) *grpc.Device {
-	device := c.sandbox.devManager.GetDeviceByID(dev.ID)
-
+func (k *kataAgent) appendBlockDevice(dev ContainerDevice, device api.Device, c *Container) *grpc.Device {
 	d, ok := device.GetDeviceInfo().(*config.BlockDrive)
 	if !ok || d == nil {
 		k.Logger().WithField("device", device).Error("malformed block drive")
@@ -1184,9 +1156,7 @@ func (k *kataAgent) appendBlockDevice(dev ContainerDevice, c *Container) *grpc.D
 	return kataDevice
 }
 
-func (k *kataAgent) appendVhostUserBlkDevice(dev ContainerDevice, c *Container) *grpc.Device {
-	device := c.sandbox.devManager.GetDeviceByID(dev.ID)
-
+func (k *kataAgent) appendVhostUserBlkDevice(dev ContainerDevice, device api.Device, c *Container) *grpc.Device {
 	d, ok := device.GetDeviceInfo().(*config.VhostUserDeviceAttrs)
 	if !ok || d == nil {
 		k.Logger().WithField("device", device).Error("malformed vhost-user-blk drive")
@@ -1202,9 +1172,68 @@ func (k *kataAgent) appendVhostUserBlkDevice(dev ContainerDevice, c *Container) 
 	return kataDevice
 }
 
-func (k *kataAgent) appendDevices(deviceList []*grpc.Device, c *Container) []*grpc.Device {
-	var kataDevice *grpc.Device
+func (k *kataAgent) appendVfioDevice(dev ContainerDevice, device api.Device, c *Container) *grpc.Device {
+	devList, ok := device.GetDeviceInfo().([]*config.VFIODev)
+	if !ok || devList == nil {
+		k.Logger().WithField("device", device).Error("malformed vfio device")
+		return nil
+	}
 
+	groupNum := filepath.Base(dev.ContainerPath)
+
+	// For VFIO-PCI, each /dev/vfio/NN device represents a VFIO group,
+	// which could include several PCI devices. So we give group
+	// information in the main structure, then list each individual PCI
+	// device in the Options array.
+	//
+	// Each option is formatted as "DDDD:BB:DD.F=<pcipath>"
+	// DDDD:BB:DD.F is the device's PCI address on the
+	// *host*. <pcipath> is the device's PCI path in the guest
+	// (see qomGetPciPath() for details).
+	//
+	// For VFIO-AP, one VFIO group could include several queue devices. They are
+	// identified by APQNs (Adjunct Processor Queue Numbers), which do not differ
+	// between host and guest. They are passed as options so they can be awaited
+	// by the agent.
+	kataDevice := &grpc.Device{
+		ContainerPath: dev.ContainerPath,
+		Type:          kataVfioPciDevType,
+		Id:            groupNum,
+		Options:       make([]string, len(devList)),
+	}
+
+	// We always pass the device information to the agent, since
+	// it needs that to wait for them to be ready.  But depending
+	// on the vfio_mode, we need to use a different device type so
+	// the agent can handle it properly
+	if c.sandbox.config.VfioMode == config.VFIOModeGuestKernel {
+		kataDevice.Type = kataVfioPciGuestKernelDevType
+	}
+	for i, dev := range devList {
+		if dev.Type == config.VFIOAPDeviceMediatedType {
+			kataDevice.Type = kataVfioApDevType
+			coldPlugVFIO := (c.sandbox.config.HypervisorConfig.ColdPlugVFIO != config.NoPort)
+			if coldPlugVFIO && c.sandbox.config.VfioMode == config.VFIOModeVFIO {
+				// A new device type is required for cold-plugging VFIO-AP.
+				// The VM guest should handle this differently from hot-plugging VFIO-AP
+				// (e.g., wait_for_ap_device).
+				// Note that a device already exists for cold-plugging VFIO-AP
+				// at the time the device type is checked.
+				kataDevice.Type = kataVfioApColdDevType
+			}
+			kataDevice.Options = dev.APDevices
+		} else {
+
+			devBDF := drivers.GetBDF(dev.BDF)
+			kataDevice.Options[i] = fmt.Sprintf("0000:%s=%s", devBDF, dev.GuestPciPath)
+		}
+
+	}
+
+	return kataDevice
+}
+
+func (k *kataAgent) appendDevices(deviceList []*grpc.Device, c *Container) []*grpc.Device {
 	for _, dev := range c.devices {
 		device := c.sandbox.devManager.GetDeviceByID(dev.ID)
 		if device == nil {
@@ -1212,14 +1241,22 @@ func (k *kataAgent) appendDevices(deviceList []*grpc.Device, c *Container) []*gr
 			return nil
 		}
 
-		switch device.DeviceType() {
-		case config.DeviceBlock:
-			kataDevice = k.appendBlockDevice(dev, c)
-		case config.VhostUserBlk:
-			kataDevice = k.appendVhostUserBlkDevice(dev, c)
+		if strings.HasPrefix(dev.ContainerPath, defaultKataGuestVirtualVolumedir) {
+			continue
 		}
 
-		if kataDevice == nil {
+		var kataDevice *grpc.Device
+
+		switch device.DeviceType() {
+		case config.DeviceBlock:
+			kataDevice = k.appendBlockDevice(dev, device, c)
+		case config.VhostUserBlk:
+			kataDevice = k.appendVhostUserBlkDevice(dev, device, c)
+		case config.DeviceVFIO:
+			kataDevice = k.appendVfioDevice(dev, device, c)
+		}
+
+		if kataDevice == nil || kataDevice.Type == "" {
 			continue
 		}
 
@@ -1239,90 +1276,79 @@ func (k *kataAgent) rollbackFailingContainerCreation(ctx context.Context, c *Con
 			k.Logger().WithError(err2).Error("rollback failed unmountHostMounts()")
 		}
 
-		if err2 := bindUnmountContainerRootfs(ctx, getMountPath(c.sandbox.id), c.id); err2 != nil {
-			k.Logger().WithError(err2).Error("rollback failed bindUnmountContainerRootfs()")
+		if err2 := c.sandbox.fsShare.UnshareRootFilesystem(ctx, c); err2 != nil {
+			k.Logger().WithError(err2).Error("rollback failed UnshareRootfs()")
 		}
 	}
 }
 
-func (k *kataAgent) buildContainerRootfs(ctx context.Context, sandbox *Sandbox, c *Container, rootPathParent string) (*grpc.Storage, error) {
-	if c.state.Fstype != "" && c.state.BlockDeviceID != "" {
-		// The rootfs storage volume represents the container rootfs
-		// mount point inside the guest.
-		// It can be a block based device (when using block based container
-		// overlay on the host) mount or a 9pfs one (for all other overlay
-		// implementations).
-		rootfs := &grpc.Storage{}
-
-		// This is a block based device rootfs.
-		device := sandbox.devManager.GetDeviceByID(c.state.BlockDeviceID)
-		if device == nil {
-			k.Logger().WithField("device", c.state.BlockDeviceID).Error("failed to find device by id")
-			return nil, fmt.Errorf("failed to find device by id %q", c.state.BlockDeviceID)
-		}
-
-		blockDrive, ok := device.GetDeviceInfo().(*config.BlockDrive)
-		if !ok || blockDrive == nil {
-			k.Logger().Error("malformed block drive")
-			return nil, fmt.Errorf("malformed block drive")
-		}
-		switch {
-		case sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioMmio:
-			rootfs.Driver = kataMmioBlkDevType
-			rootfs.Source = blockDrive.VirtPath
-		case sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlockCCW:
-			rootfs.Driver = kataBlkCCWDevType
-			rootfs.Source = blockDrive.DevNo
-		case sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlock:
-			rootfs.Driver = kataBlkDevType
-			rootfs.Source = blockDrive.PCIPath.String()
-		case sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioSCSI:
-			rootfs.Driver = kataSCSIDevType
-			rootfs.Source = blockDrive.SCSIAddr
-		default:
-			return nil, fmt.Errorf("Unknown block device driver: %s", sandbox.config.HypervisorConfig.BlockDeviceDriver)
-		}
-
-		rootfs.MountPoint = rootPathParent
-		rootfs.Fstype = c.state.Fstype
-
-		if c.state.Fstype == "xfs" {
-			rootfs.Options = []string{"nouuid"}
-		}
-
-		// Ensure container mount destination exists
-		// TODO: remove dependency on shared fs path. shared fs is just one kind of storage source.
-		// we should not always use shared fs path for all kinds of storage. Instead, all storage
-		// should be bind mounted to a tmpfs path for containers to use.
-		if err := os.MkdirAll(filepath.Join(getMountPath(c.sandbox.id), c.id, c.rootfsSuffix), DirMode); err != nil {
-			return nil, err
-		}
-		return rootfs, nil
+func (k *kataAgent) setupNetworks(ctx context.Context, sandbox *Sandbox, c *Container) error {
+	if sandbox.network.NetworkID() == "" {
+		return nil
 	}
 
-	// This is not a block based device rootfs. We are going to bind mount it into the shared drive
-	// between the host and the guest.
-	// With virtiofs/9pfs we don't need to ask the agent to mount the rootfs as the shared directory
-	// (kataGuestSharedDir) is already mounted in the guest. We only need to mount the rootfs from
-	// the host and it will show up in the guest.
-	if err := bindMountContainerRootfs(ctx, getMountPath(sandbox.id), c.id, c.rootFs.Target, false); err != nil {
-		return nil, err
+	var err error
+	var endpoints []Endpoint
+	if c == nil || c.id == sandbox.id {
+		// TODO: VFIO network deivce has not been hotplugged when creating the Sandbox,
+		// so need to skip VFIO endpoint here.
+		// After KEP #4113(https://github.com/kubernetes/enhancements/pull/4113)
+		// is implemented, the VFIO network devices will be attached before container
+		// creation, so no need to skip them here anymore.
+		for _, ep := range sandbox.network.Endpoints() {
+			if ep.Type() != VfioEndpointType {
+				endpoints = append(endpoints, ep)
+			}
+		}
+	} else if !sandbox.hotplugNetworkConfigApplied {
+		// Apply VFIO network devices' configuration after they are hot-plugged.
+		for _, ep := range sandbox.network.Endpoints() {
+			if ep.Type() == VfioEndpointType {
+				hostBDF := ep.(*VfioEndpoint).HostBDF
+				pciPath := sandbox.GetVfioDeviceGuestPciPath(hostBDF)
+				if pciPath.IsNil() {
+					return fmt.Errorf("PCI path for VFIO interface '%s' not found", ep.Name())
+				}
+				ep.SetPciPath(pciPath)
+				endpoints = append(endpoints, ep)
+			}
+		}
+
+		defer func() {
+			if err == nil {
+				sandbox.hotplugNetworkConfigApplied = true
+			}
+		}()
 	}
 
-	return nil, nil
+	if len(endpoints) == 0 {
+		return nil
+	}
+
+	interfaces, routes, neighs, err := generateVCNetworkStructures(ctx, endpoints)
+	if err != nil {
+		return err
+	}
+
+	if err = k.updateInterfaces(ctx, interfaces); err != nil {
+		return err
+	}
+	if _, err = k.updateRoutes(ctx, routes); err != nil {
+		return err
+	}
+	if err = k.addARPNeighbors(ctx, neighs); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Container) (p *Process, err error) {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "createContainer", kataAgentTracingTags)
 	defer span.End()
-
 	var ctrStorages []*grpc.Storage
 	var ctrDevices []*grpc.Device
-	var rootfs *grpc.Storage
-
-	// This is the guest absolute root path for that container.
-	rootPathParent := filepath.Join(kataGuestSharedDir(), c.id)
-	rootPath := filepath.Join(rootPathParent, c.rootfsSuffix)
+	var sharedRootfs *SharedFile
 
 	// In case the container creation fails, the following defer statement
 	// takes care of rolling back actions previously performed.
@@ -1333,19 +1359,24 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 		}
 	}()
 
-	// setup rootfs -- if its block based, we'll receive a non-nil storage object representing
+	// Share the container rootfs -- if its block based, we'll receive a non-nil storage object representing
 	// the block device for the rootfs, which us utilized for mounting in the guest. This'll be handled
 	// already for non-block based rootfs
-	if rootfs, err = k.buildContainerRootfs(ctx, sandbox, c, rootPathParent); err != nil {
+	if sharedRootfs, err = sandbox.fsShare.ShareRootFilesystem(ctx, c); err != nil {
 		return nil, err
 	}
 
-	if rootfs != nil {
+	if sharedRootfs.containerStorages != nil {
 		// Add rootfs to the list of container storage.
-		// We only need to do this for block based rootfs, as we
+		ctrStorages = append(ctrStorages, sharedRootfs.containerStorages...)
+	}
+
+	if sharedRootfs.volumeStorages != nil {
+		// Add volumeStorages to the list of container storage.
+		// We only need to do this for KataVirtualVolume based rootfs, as we
 		// want the agent to mount it into the right location
-		// (kataGuestSharedDir/ctrID/
-		ctrStorages = append(ctrStorages, rootfs)
+
+		ctrStorages = append(ctrStorages, sharedRootfs.volumeStorages...)
 	}
 
 	ociSpec := c.GetPatchedOCISpec()
@@ -1372,6 +1403,13 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 
 	ctrStorages = append(ctrStorages, epheStorages...)
 
+	k.Logger().WithField("ociSpec Hugepage Resources", ociSpec.Linux.Resources.HugepageLimits).Debug("ociSpec HugepageLimit")
+	hugepages, err := k.handleHugepages(ociSpec.Mounts, ociSpec.Linux.Resources.HugepageLimits)
+	if err != nil {
+		return nil, err
+	}
+	ctrStorages = append(ctrStorages, hugepages...)
+
 	localStorages, err := k.handleLocalStorage(ociSpec.Mounts, sandbox.id, c.rootfsSuffix)
 	if err != nil {
 		return nil, err
@@ -1393,20 +1431,18 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 	// Append container devices for block devices passed with --device.
 	ctrDevices = k.appendDevices(ctrDevices, c)
 
-	// Handle all the volumes that are block device files.
-	// Note this call modifies the list of container devices to make sure
-	// all hotplugged devices are unplugged, so this needs be done
-	// after devices passed with --device are handled.
-	volumeStorages, err := k.handleBlockVolumes(c)
+	// Block based volumes will require some adjustments in the OCI spec, and creation of
+	// storage objects to pass to the agent.
+	layerStorages, volumeStorages, err := k.handleBlkOCIMounts(c, ociSpec)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := k.replaceOCIMountsForStorages(ociSpec, volumeStorages); err != nil {
-		return nil, err
-	}
-
 	ctrStorages = append(ctrStorages, volumeStorages...)
+
+	// Layer storage objects are prepended to the list so that they come _before_ the
+	// rootfs because the rootfs depends on them (it's an overlay of the layers).
+	ctrStorages = append(layerStorages, ctrStorages...)
 
 	grpcSpec, err := grpc.OCItoGRPC(ociSpec)
 	if err != nil {
@@ -1414,15 +1450,30 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 	}
 
 	// We need to give the OCI spec our absolute rootfs path in the guest.
-	grpcSpec.Root.Path = rootPath
+	grpcSpec.Root.Path = sharedRootfs.guestPath
 
 	sharedPidNs := k.handlePidNamespace(grpcSpec, sandbox)
 
+	if !sandbox.config.DisableGuestSeccomp && !sandbox.seccompSupported {
+		return nil, fmt.Errorf("Seccomp profiles are passed to the virtual machine, but the Kata agent does not support seccomp")
+	}
+
 	passSeccomp := !sandbox.config.DisableGuestSeccomp && sandbox.seccompSupported
 
-	// We need to constraint the spec to make sure we're not passing
-	// irrelevant information to the agent.
-	k.constraintGRPCSpec(grpcSpec, passSeccomp)
+	// Currently, guest SELinux can be enabled only when SELinux is enabled on the host side.
+	if !sandbox.config.HypervisorConfig.DisableGuestSeLinux && !selinux.GetEnabled() {
+		return nil, fmt.Errorf("Guest SELinux is enabled, but SELinux is disabled on the host side")
+	}
+	if sandbox.config.HypervisorConfig.DisableGuestSeLinux && sandbox.config.GuestSeLinuxLabel != "" {
+		return nil, fmt.Errorf("Custom SELinux security policy is provided, but guest SELinux is disabled")
+	}
+
+	// We need to constrain the spec to make sure we're not
+	// passing irrelevant information to the agent.
+	err = k.constrainGRPCSpec(grpcSpec, passSeccomp, sandbox.config.HypervisorConfig.DisableGuestSeLinux, sandbox.config.GuestSeLinuxLabel, sandbox.config.VfioMode == config.VFIOModeGuestKernel)
+	if err != nil {
+		return nil, err
+	}
 
 	req := &grpc.CreateContainerRequest{
 		ContainerId:  c.id,
@@ -1434,6 +1485,13 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 	}
 
 	if _, err = k.sendReq(ctx, req); err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "CreateContainerRequest timed out")
+		}
+		return nil, err
+	}
+
+	if err = k.setupNetworks(ctx, sandbox, c); err != nil {
 		return nil, err
 	}
 
@@ -1446,6 +1504,71 @@ func buildProcessFromExecID(token string) (*Process, error) {
 		StartTime: time.Now().UTC(),
 		Pid:       -1,
 	}, nil
+}
+
+// handleHugePages handles hugepages storage by
+// creating a Storage from corresponding source of the mount point
+func (k *kataAgent) handleHugepages(mounts []specs.Mount, hugepageLimits []specs.LinuxHugepageLimit) ([]*grpc.Storage, error) {
+	//Map to hold the total memory of each type of hugepages
+	optionsMap := make(map[int64]string)
+
+	for _, hp := range hugepageLimits {
+		if hp.Limit != 0 {
+			k.Logger().WithFields(logrus.Fields{
+				"Pagesize": hp.Pagesize,
+				"Limit":    hp.Limit,
+			}).Info("hugepage request")
+			//example Pagesize 2MB, 1GB etc. The Limit are in Bytes
+			pageSize, err := units.RAMInBytes(hp.Pagesize)
+			if err != nil {
+				k.Logger().Error("Unable to convert pagesize to bytes")
+				return nil, err
+			}
+			totalHpSizeStr := strconv.FormatUint(hp.Limit, 10)
+			optionsMap[pageSize] = totalHpSizeStr
+		}
+	}
+
+	var hugepages []*grpc.Storage
+	for idx, mnt := range mounts {
+		if mnt.Type != KataLocalDevType {
+			continue
+		}
+		//HugePages mount Type is Local
+		if _, fsType, fsOptions, _ := utils.GetDevicePathAndFsTypeOptions(mnt.Source); fsType == "hugetlbfs" {
+			k.Logger().WithField("fsOptions", fsOptions).Debug("hugepage mount options")
+			//Find the pagesize from the mountpoint options
+			pagesizeOpt := getPagesizeFromOpt(fsOptions)
+			if pagesizeOpt == "" {
+				return nil, fmt.Errorf("No pagesize option found in filesystem mount options")
+			}
+			pageSize, err := units.RAMInBytes(pagesizeOpt)
+			if err != nil {
+				k.Logger().Error("Unable to convert pagesize from fs mount options to bytes")
+				return nil, err
+			}
+			//Create mount option string
+			options := fmt.Sprintf("pagesize=%s,size=%s", strconv.FormatInt(pageSize, 10), optionsMap[pageSize])
+			k.Logger().WithField("Hugepage options string", options).Debug("hugepage mount options")
+			// Set the mount source path to a path that resides inside the VM
+			mounts[idx].Source = filepath.Join(ephemeralPath(), filepath.Base(mnt.Source))
+			// Set the mount type to "bind"
+			mounts[idx].Type = "bind"
+
+			// Create a storage struct so that kata agent is able to create
+			// hugetlbfs backed volume inside the VM
+			hugepage := &grpc.Storage{
+				Driver:     KataEphemeralDevType,
+				Source:     "nodev",
+				Fstype:     "hugetlbfs",
+				MountPoint: mounts[idx].Source,
+				Options:    []string{options},
+			}
+			hugepages = append(hugepages, hugepage)
+		}
+
+	}
+	return hugepages, nil
 }
 
 // handleEphemeralStorage handles ephemeral storages by
@@ -1536,14 +1659,11 @@ func (k *kataAgent) handleLocalStorage(mounts []specs.Mount, sandboxID string, r
 	return localStorages, nil
 }
 
-// handleDeviceBlockVolume handles volume that is block device file
-// and DeviceBlock type.
-func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.Device) (*grpc.Storage, error) {
+func handleBlockVolume(c *Container, device api.Device) (*grpc.Storage, error) {
 	vol := &grpc.Storage{}
 
 	blockDrive, ok := device.GetDeviceInfo().(*config.BlockDrive)
 	if !ok || blockDrive == nil {
-		k.Logger().Error("malformed block drive")
 		return nil, fmt.Errorf("malformed block drive")
 	}
 	switch {
@@ -1568,6 +1688,98 @@ func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.De
 	default:
 		return nil, fmt.Errorf("Unknown block device driver: %s", c.sandbox.config.HypervisorConfig.BlockDeviceDriver)
 	}
+	return vol, nil
+}
+
+// getContainerTypeforCRI get container type from different CRI annotations
+func getContainerTypeforCRI(c *Container) (string, string) {
+
+	// CRIContainerTypeKeyList lists all the CRI keys that could define
+	// the container type from annotations in the config.json.
+	CRIContainerTypeKeyList := []string{ctrAnnotations.ContainerType, podmanAnnotations.ContainerType}
+	containerType := c.config.Annotations[vcAnnotations.ContainerTypeKey]
+	for _, key := range CRIContainerTypeKeyList {
+		_, ok := c.config.CustomSpec.Annotations[key]
+		if ok {
+			return containerType, key
+		}
+	}
+	return "", ""
+}
+
+func handleImageGuestPullBlockVolume(c *Container, virtualVolumeInfo *types.KataVirtualVolume, vol *grpc.Storage) (*grpc.Storage, error) {
+	container_annotations := c.GetAnnotations()
+	containerType, criContainerType := getContainerTypeforCRI(c)
+
+	var image_ref string
+	if containerType == string(PodSandbox) {
+		image_ref = "pause"
+	} else {
+		const kubernetesCRIImageName = "io.kubernetes.cri.image-name"
+		const kubernetesCRIOImageName = "io.kubernetes.cri-o.ImageName"
+
+		switch criContainerType {
+		case ctrAnnotations.ContainerType:
+			image_ref = container_annotations[kubernetesCRIImageName]
+		case podmanAnnotations.ContainerType:
+			image_ref = container_annotations[kubernetesCRIOImageName]
+		default:
+			// There are cases, like when using nerdctl, where the criContainerType
+			// will never be set, leading to this code path.
+			//
+			// nerdctl also doesn't set any mechanism for automatically setting the
+			// image, but as part of it's v2.0.0 release it allows the user to set
+			// any kind of OCI annotation, which we can take advantage of and use.
+			//
+			// With this in mind, let's "fallback" to the default k8s cri image-name
+			// annotation, as documented on our image-pull documentation.
+			image_ref = container_annotations[kubernetesCRIImageName]
+		}
+
+		if image_ref == "" {
+			return nil, fmt.Errorf("Failed to get image name from annotations")
+		}
+	}
+	virtualVolumeInfo.Source = image_ref
+
+	//merge virtualVolumeInfo.ImagePull.Metadata and container_annotations
+	for k, v := range container_annotations {
+		virtualVolumeInfo.ImagePull.Metadata[k] = v
+	}
+
+	no, err := json.Marshal(virtualVolumeInfo.ImagePull)
+	if err != nil {
+		return nil, err
+	}
+	vol.Driver = types.KataVirtualVolumeImageGuestPullType
+	vol.DriverOptions = append(vol.DriverOptions, types.KataVirtualVolumeImageGuestPullType+"="+string(no))
+	vol.Source = virtualVolumeInfo.Source
+	vol.Fstype = typeOverlayFS
+	return vol, nil
+}
+
+// handleVirtualVolumeStorageObject handles KataVirtualVolume that is block device file.
+func handleVirtualVolumeStorageObject(c *Container, blockDeviceId string, virtVolume *types.KataVirtualVolume) (*grpc.Storage, error) {
+	var vol *grpc.Storage
+	if virtVolume.VolumeType == types.KataVirtualVolumeImageGuestPullType {
+		var err error
+		vol = &grpc.Storage{}
+		vol, err = handleImageGuestPullBlockVolume(c, virtVolume, vol)
+		if err != nil {
+			return nil, err
+		}
+		vol.MountPoint = filepath.Join("/run/kata-containers/", c.id, c.rootfsSuffix)
+	}
+	return vol, nil
+}
+
+// handleDeviceBlockVolume handles volume that is block device file
+// and DeviceBlock type.
+func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.Device) (*grpc.Storage, error) {
+	vol, err := handleBlockVolume(c, device)
+	if err != nil {
+		return nil, err
+	}
 
 	vol.MountPoint = m.Destination
 
@@ -1577,6 +1789,12 @@ func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.De
 	}
 	if len(vol.Options) == 0 {
 		vol.Options = m.Options
+	}
+	if m.FSGroup != nil {
+		vol.FsGroup = &grpc.FSGroup{
+			GroupId:           uint32(*m.FSGroup),
+			GroupChangePolicy: getFSGroupChangePolicy(m.FSGroupChangePolicy),
+		}
 	}
 
 	return vol, nil
@@ -1599,16 +1817,47 @@ func (k *kataAgent) handleVhostUserBlkVolume(c *Container, m Mount, device api.D
 	vol.Options = []string{"bind"}
 	vol.MountPoint = m.Destination
 
+	// Assign the type from the mount, if it's specified (e.g. direct assigned volume)
+	if m.Type != "" {
+		vol.Fstype = m.Type
+		vol.Options = m.Options
+	}
+
 	return vol, nil
 }
 
-// handleBlockVolumes handles volumes that are block devices files
-// by passing the block devices as Storage to the agent.
-func (k *kataAgent) handleBlockVolumes(c *Container) ([]*grpc.Storage, error) {
+func (k *kataAgent) createBlkStorageObject(c *Container, m Mount) (*grpc.Storage, error) {
+	var vol *grpc.Storage
+
+	id := m.BlockDeviceID
+	device := c.sandbox.devManager.GetDeviceByID(id)
+	if device == nil {
+		k.Logger().WithField("device", id).Error("failed to find device by id")
+		return nil, fmt.Errorf("Failed to find device by id (id=%s)", id)
+	}
+
+	var err error
+	switch device.DeviceType() {
+	case config.DeviceBlock:
+		vol, err = k.handleDeviceBlockVolume(c, m, device)
+	case config.VhostUserBlk:
+		vol, err = k.handleVhostUserBlkVolume(c, m, device)
+	default:
+		return nil, fmt.Errorf("Unknown device type")
+	}
+
+	return vol, err
+}
+
+// handleBlkOCIMounts will create a unique destination mountpoint in the guest for each volume in the
+// given container and will update the OCI spec to utilize this mount point as the new source for the
+// container volume. The container mount structure is updated to store the guest destination mountpoint.
+func (k *kataAgent) handleBlkOCIMounts(c *Container, spec *specs.Spec) ([]*grpc.Storage, []*grpc.Storage, error) {
 
 	var volumeStorages []*grpc.Storage
+	var layerStorages []*grpc.Storage
 
-	for _, m := range c.mounts {
+	for i, m := range c.mounts {
 		id := m.BlockDeviceID
 
 		if len(id) == 0 {
@@ -1619,33 +1868,50 @@ func (k *kataAgent) handleBlockVolumes(c *Container) ([]*grpc.Storage, error) {
 		// device is detached with detachDevices() for a container.
 		c.devices = append(c.devices, ContainerDevice{ID: id, ContainerPath: m.Destination})
 
-		var vol *grpc.Storage
-
-		device := c.sandbox.devManager.GetDeviceByID(id)
-		if device == nil {
-			k.Logger().WithField("device", id).Error("failed to find device by id")
-			return nil, fmt.Errorf("Failed to find device by id (id=%s)", id)
+		// Create Storage structure
+		vol, err := k.createBlkStorageObject(c, m)
+		if vol == nil || err != nil {
+			return nil, nil, err
 		}
 
-		var err error
-		switch device.DeviceType() {
-		case config.DeviceBlock:
-			vol, err = k.handleDeviceBlockVolume(c, m, device)
-		case config.VhostUserBlk:
-			vol, err = k.handleVhostUserBlkVolume(c, m, device)
-		default:
-			k.Logger().Error("Unknown device type")
+		if HasOption(m.Options, vcAnnotations.IsFileSystemLayer) {
+			layerStorages = append(layerStorages, vol)
 			continue
 		}
 
-		if vol == nil || err != nil {
-			return nil, err
+		// Each device will be mounted at a unique location within the VM only once. Mounting
+		// to the container specific location is handled within the OCI spec. Let's ensure that
+		// the storage mount point is unique for each device. This is then utilized as the source
+		// in the OCI spec. If multiple containers mount the same block device, it's ref-counted inside
+		// the guest by Kata agent.
+		filename := b64.URLEncoding.EncodeToString([]byte(vol.Source))
+		path := filepath.Join(kataGuestSandboxStorageDir(), filename)
+
+		// Update applicable OCI mount source
+		for idx, ociMount := range spec.Mounts {
+			if ociMount.Destination != vol.MountPoint {
+				continue
+			}
+			k.Logger().WithFields(logrus.Fields{
+				"original-source": ociMount.Source,
+				"new-source":      path,
+			}).Debug("Replacing OCI mount source")
+			spec.Mounts[idx].Source = path
+			if HasOption(spec.Mounts[idx].Options, vcAnnotations.IsFileBlockDevice) {
+				// The device is already mounted, just bind to path in container.
+				spec.Mounts[idx].Options = []string{"bind"}
+			}
+			break
 		}
+
+		// Update storage mountpoint, and save guest device mount path to container mount struct:
+		vol.MountPoint = path
+		c.mounts[i].GuestDeviceMount = path
 
 		volumeStorages = append(volumeStorages, vol)
 	}
 
-	return volumeStorages, nil
+	return layerStorages, volumeStorages, nil
 }
 
 // handlePidNamespace checks if Pid namespace for a container needs to be shared with its sandbox
@@ -1686,6 +1952,9 @@ func (k *kataAgent) startContainer(ctx context.Context, sandbox *Sandbox, c *Con
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "StartContainerRequest timed out")
+	}
 	return err
 }
 
@@ -1694,6 +1963,9 @@ func (k *kataAgent) stopContainer(ctx context.Context, sandbox *Sandbox, c Conta
 	defer span.End()
 
 	_, err := k.sendReq(ctx, &grpc.RemoveContainerRequest{ContainerId: c.id})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "RemoveContainerRequest timed out")
+	}
 	return err
 }
 
@@ -1710,6 +1982,9 @@ func (k *kataAgent) signalProcess(ctx context.Context, c *Container, processID s
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "SignalProcessRequest timed out")
+	}
 	return err
 }
 
@@ -1722,6 +1997,9 @@ func (k *kataAgent) winsizeProcess(ctx context.Context, c *Container, processID 
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "TtyWinResizeRequest timed out")
+	}
 	return err
 }
 
@@ -1737,6 +2015,9 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 	}
 
 	_, err = k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "UpdateContainerRequest timed out")
+	}
 	return err
 }
 
@@ -1746,6 +2027,9 @@ func (k *kataAgent) pauseContainer(ctx context.Context, sandbox *Sandbox, c Cont
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "PauseContainerRequest timed out")
+	}
 	return err
 }
 
@@ -1755,6 +2039,9 @@ func (k *kataAgent) resumeContainer(ctx context.Context, sandbox *Sandbox, c Con
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "ResumeContainerRequest timed out")
+	}
 	return err
 }
 
@@ -1779,6 +2066,9 @@ func (k *kataAgent) memHotplugByProbe(ctx context.Context, addr uint64, sizeMB u
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "MemHotplugByProbeRequest timed out")
+	}
 	return err
 }
 
@@ -1790,6 +2080,9 @@ func (k *kataAgent) onlineCPUMem(ctx context.Context, cpus uint32, cpuOnly bool)
 	}
 
 	_, err := k.sendReq(ctx, req)
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "OnlineCPUMemRequest timed out")
+	}
 	return err
 }
 
@@ -1801,6 +2094,9 @@ func (k *kataAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Cont
 	returnStats, err := k.sendReq(ctx, req)
 
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "StatsContainerRequest timed out")
+		}
 		return nil, err
 	}
 
@@ -1858,7 +2154,7 @@ func (k *kataAgent) connect(ctx context.Context) error {
 }
 
 func (k *kataAgent) disconnect(ctx context.Context) error {
-	span, _ := katatrace.Trace(ctx, k.Logger(), "disconnect", kataAgentTracingTags)
+	span, _ := katatrace.Trace(ctx, k.Logger(), "Disconnect", kataAgentTracingTags)
 	defer span.End()
 
 	k.Lock()
@@ -1882,7 +2178,10 @@ func (k *kataAgent) disconnect(ctx context.Context) error {
 func (k *kataAgent) check(ctx context.Context) error {
 	_, err := k.sendReq(ctx, &grpc.CheckRequest{})
 	if err != nil {
-		err = fmt.Errorf("Failed to check if grpc server is working: %s", err)
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "CheckRequest timed out")
+		}
+		err = fmt.Errorf("Failed to Check if grpc server is working: %s", err)
 	}
 	return err
 }
@@ -1896,6 +2195,9 @@ func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID str
 		ExecId:      processID,
 	})
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return 0, status.Errorf(codes.DeadlineExceeded, "WaitProcessRequest timed out")
+		}
 		return 0, err
 	}
 
@@ -1910,6 +2212,9 @@ func (k *kataAgent) writeProcessStdin(ctx context.Context, c *Container, Process
 	})
 
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return 0, status.Errorf(codes.DeadlineExceeded, "WriteStreamRequest timed out")
+		}
 		return 0, err
 	}
 
@@ -1921,7 +2226,9 @@ func (k *kataAgent) closeProcessStdin(ctx context.Context, c *Container, Process
 		ContainerId: c.id,
 		ExecId:      ProcessID,
 	})
-
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "CloseStdinRequest timed out")
+	}
 	return err
 }
 
@@ -1929,7 +2236,17 @@ func (k *kataAgent) reseedRNG(ctx context.Context, data []byte) error {
 	_, err := k.sendReq(ctx, &grpc.ReseedRandomDevRequest{
 		Data: data,
 	})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "ReseedRandomDevRequest timed out")
+	}
+	return err
+}
 
+func (k *kataAgent) removeStaleVirtiofsShareMounts(ctx context.Context) error {
+	_, err := k.sendReq(ctx, &grpc.RemoveStaleVirtiofsShareMountsRequest{})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "removeStaleVirtiofsShareMounts timed out")
+	}
 	return err
 }
 
@@ -1966,6 +2283,9 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	}
 	k.reqHandlers[grpcUpdateInterfaceRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.UpdateInterface(ctx, req.(*grpc.UpdateInterfaceRequest))
+	}
+	k.reqHandlers[grpcUpdateEphemeralMountsRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.UpdateEphemeralMounts(ctx, req.(*grpc.UpdateEphemeralMountsRequest))
 	}
 	k.reqHandlers[grpcListInterfacesRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.ListInterfaces(ctx, req.(*grpc.ListInterfacesRequest))
@@ -2018,12 +2338,6 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	k.reqHandlers[grpcSetGuestDateTimeRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.SetGuestDateTime(ctx, req.(*grpc.SetGuestDateTimeRequest))
 	}
-	k.reqHandlers[grpcStartTracingRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
-		return k.client.AgentServiceClient.StartTracing(ctx, req.(*grpc.StartTracingRequest))
-	}
-	k.reqHandlers[grpcStopTracingRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
-		return k.client.AgentServiceClient.StopTracing(ctx, req.(*grpc.StopTracingRequest))
-	}
 	k.reqHandlers[grpcGetOOMEventRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.GetOOMEvent(ctx, req.(*grpc.GetOOMEventRequest))
 	}
@@ -2032,6 +2346,24 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	}
 	k.reqHandlers[grpcAddSwapRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.AddSwap(ctx, req.(*grpc.AddSwapRequest))
+	}
+	k.reqHandlers[grpcVolumeStatsRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.GetVolumeStats(ctx, req.(*grpc.VolumeStatsRequest))
+	}
+	k.reqHandlers[grpcResizeVolumeRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.ResizeVolume(ctx, req.(*grpc.ResizeVolumeRequest))
+	}
+	k.reqHandlers[grpcGetIPTablesRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.GetIPTables(ctx, req.(*grpc.GetIPTablesRequest))
+	}
+	k.reqHandlers[grpcSetIPTablesRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.SetIPTables(ctx, req.(*grpc.SetIPTablesRequest))
+	}
+	k.reqHandlers[grpcRemoveStaleVirtiofsShareMountsRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.RemoveStaleVirtiofsShareMounts(ctx, req.(*grpc.RemoveStaleVirtiofsShareMountsRequest))
+	}
+	k.reqHandlers[grpcSetPolicyRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.SetPolicy(ctx, req.(*grpc.SetPolicyRequest))
 	}
 }
 
@@ -2042,8 +2374,15 @@ func (k *kataAgent) getReqContext(ctx context.Context, reqName string) (newCtx c
 		// Wait and GetOOMEvent have no timeout
 	case grpcCheckRequest:
 		newCtx, cancel = context.WithTimeout(ctx, checkRequestTimeout)
+	case grpcCreateContainerRequest:
+		newCtx, cancel = context.WithTimeout(ctx, createContainerRequestTimeout)
 	default:
-		newCtx, cancel = context.WithTimeout(ctx, defaultRequestTimeout)
+		var requestTimeout = defaultRequestTimeout
+
+		if timeout, ok := ctx.Value(customRequestTimeoutKey).(time.Duration); ok {
+			requestTimeout = timeout
+		}
+		newCtx, cancel = context.WithTimeout(ctx, requestTimeout)
 	}
 
 	return newCtx, cancel
@@ -2059,17 +2398,34 @@ func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (inter
 		defer k.disconnect(spanCtx)
 	}
 
-	msgName := proto.MessageName(request.(proto.Message))
+	msgName := string(proto.MessageName(request.(proto.Message)))
+
+	k.Lock()
+
+	if k.reqHandlers == nil {
+		k.Unlock()
+		return nil, errors.New("Client has already disconnected")
+	}
+
 	handler := k.reqHandlers[msgName]
 	if msgName == "" || handler == nil {
+		k.Unlock()
 		return nil, errors.New("Invalid request type")
 	}
+
+	k.Unlock()
+
 	message := request.(proto.Message)
 	ctx, cancel := k.getReqContext(spanCtx, msgName)
 	if cancel != nil {
 		defer cancel()
 	}
-	k.Logger().WithField("name", msgName).WithField("req", message.String()).Trace("sending request")
+
+	jsonStr, err := protojson.Marshal(message)
+	if err != nil {
+		return nil, err
+	}
+	k.Logger().WithField("name", msgName).WithField("req", string(jsonStr)).Trace("sending request")
 
 	defer func() {
 		agentRPCDurationsHistogram.WithLabelValues(msgName).Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
@@ -2112,13 +2468,15 @@ func (k *kataAgent) readProcessStream(containerID, processID string, data []byte
 		copy(data, resp.Data)
 		return len(resp.Data), nil
 	}
-
 	return 0, err
 }
 
 func (k *kataAgent) getGuestDetails(ctx context.Context, req *grpc.GuestDetailsRequest) (*grpc.GuestDetailsResponse, error) {
 	resp, err := k.sendReq(ctx, req)
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "GuestDetailsRequest request timed out")
+		}
 		return nil, err
 	}
 
@@ -2130,47 +2488,69 @@ func (k *kataAgent) setGuestDateTime(ctx context.Context, tv time.Time) error {
 		Sec:  tv.Unix(),
 		Usec: int64(tv.Nanosecond() / 1e3),
 	})
-
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "SetGuestDateTimeRequest request timed out")
+	}
 	return err
 }
 
 func (k *kataAgent) copyFile(ctx context.Context, src, dst string) error {
 	var st unix.Stat_t
 
-	err := unix.Stat(src, &st)
+	err := unix.Lstat(src, &st)
 	if err != nil {
 		return fmt.Errorf("Could not get file %s information: %v", src, err)
 	}
 
-	b, err := ioutil.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("Could not read file %s: %v", src, err)
+	cpReq := &grpc.CopyFileRequest{
+		Path:     dst,
+		DirMode:  uint32(DirMode),
+		FileMode: st.Mode,
+		Uid:      int32(st.Uid),
+		Gid:      int32(st.Gid),
 	}
 
-	fileSize := int64(len(b))
+	var b []byte
+
+	switch sflag := st.Mode & unix.S_IFMT; sflag {
+	case unix.S_IFREG:
+		var err error
+		// TODO: Support incremental file copying instead of loading whole file into memory
+		b, err = os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("Could not read file %s: %v", src, err)
+		}
+		cpReq.FileSize = int64(len(b))
+
+	case unix.S_IFDIR:
+
+	case unix.S_IFLNK:
+		symlink, err := os.Readlink(src)
+		if err != nil {
+			return fmt.Errorf("Could not read symlink %s: %v", src, err)
+		}
+		cpReq.Data = []byte(symlink)
+
+	default:
+		return fmt.Errorf("Unsupported file type: %o", sflag)
+	}
 
 	k.Logger().WithFields(logrus.Fields{
 		"source": src,
 		"dest":   dst,
 	}).Debugf("Copying file from host to guest")
 
-	cpReq := &grpc.CopyFileRequest{
-		Path:     dst,
-		DirMode:  uint32(DirMode),
-		FileMode: st.Mode,
-		FileSize: fileSize,
-		Uid:      int32(st.Uid),
-		Gid:      int32(st.Gid),
-	}
-
 	// Handle the special case where the file is empty
-	if fileSize == 0 {
-		_, err = k.sendReq(ctx, cpReq)
+	if cpReq.FileSize == 0 {
+		_, err := k.sendReq(ctx, cpReq)
+		if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "CopyFileRequest timed out")
+		}
 		return err
 	}
 
 	// Copy file by parts if it's needed
-	remainingBytes := fileSize
+	remainingBytes := cpReq.FileSize
 	offset := int64(0)
 	for remainingBytes > 0 {
 		bytesToCopy := int64(len(b))
@@ -2182,6 +2562,9 @@ func (k *kataAgent) copyFile(ctx context.Context, src, dst string) error {
 		cpReq.Offset = offset
 
 		if _, err = k.sendReq(ctx, cpReq); err != nil {
+			if err.Error() == context.DeadlineExceeded.Error() {
+				return status.Errorf(codes.DeadlineExceeded, "CopyFileRequest timed out")
+			}
 			return fmt.Errorf("Could not send CopyFile request: %v", err)
 		}
 
@@ -2193,11 +2576,14 @@ func (k *kataAgent) copyFile(ctx context.Context, src, dst string) error {
 	return nil
 }
 
-func (k *kataAgent) addSwap(ctx context.Context, PCIPath vcTypes.PciPath) error {
+func (k *kataAgent) addSwap(ctx context.Context, PCIPath types.PciPath) error {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "addSwap", kataAgentTracingTags)
 	defer span.End()
 
 	_, err := k.sendReq(ctx, &grpc.AddSwapRequest{PCIPath: PCIPath.ToArray()})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "AddSwapRequest timed out")
+	}
 	return err
 }
 
@@ -2207,26 +2593,7 @@ func (k *kataAgent) markDead(ctx context.Context) {
 	k.disconnect(ctx)
 }
 
-func (k *kataAgent) cleanup(ctx context.Context, s *Sandbox) {
-	if err := k.cleanupSandboxBindMounts(s); err != nil {
-		k.Logger().WithError(err).Errorf("failed to cleanup sandbox bindmounts")
-	}
-
-	// Unmount shared path
-	path := getSharePath(s.id)
-	k.Logger().WithField("path", path).Infof("cleanup agent")
-	if err := syscall.Unmount(path, syscall.MNT_DETACH|UmountNoFollow); err != nil {
-		k.Logger().WithError(err).Errorf("failed to unmount vm share path %s", path)
-	}
-
-	// Unmount mount path
-	path = getMountPath(s.id)
-	if err := bindUnmountAllRootfs(ctx, path, s); err != nil {
-		k.Logger().WithError(err).Errorf("failed to unmount vm mount path %s", path)
-	}
-	if err := os.RemoveAll(getSandboxPath(s.id)); err != nil {
-		k.Logger().WithError(err).Errorf("failed to cleanup vm path %s", getSandboxPath(s.id))
-	}
+func (k *kataAgent) cleanup(ctx context.Context) {
 }
 
 func (k *kataAgent) save() persistapi.AgentState {
@@ -2243,6 +2610,9 @@ func (k *kataAgent) getOOMEvent(ctx context.Context) (string, error) {
 	req := &grpc.GetOOMEventRequest{}
 	result, err := k.sendReq(ctx, req)
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return "", status.Errorf(codes.DeadlineExceeded, "GetOOMEventRequest timed out")
+		}
 		return "", err
 	}
 	if oomEvent, ok := result.(*grpc.OOMEvent); ok {
@@ -2254,8 +2624,85 @@ func (k *kataAgent) getOOMEvent(ctx context.Context) (string, error) {
 func (k *kataAgent) getAgentMetrics(ctx context.Context, req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
 	resp, err := k.sendReq(ctx, req)
 	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "GetMetricsRequest timed out")
+		}
 		return nil, err
 	}
 
 	return resp.(*grpc.Metrics), nil
+}
+
+func (k *kataAgent) getIPTables(ctx context.Context, isIPv6 bool) ([]byte, error) {
+	resp, err := k.sendReq(ctx, &grpc.GetIPTablesRequest{IsIpv6: isIPv6})
+	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "GetIPTablesRequest timed out")
+		}
+		return nil, err
+	}
+	return resp.(*grpc.GetIPTablesResponse).Data, nil
+}
+
+func (k *kataAgent) setIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
+	_, err := k.sendReq(ctx, &grpc.SetIPTablesRequest{
+		IsIpv6: isIPv6,
+		Data:   data,
+	})
+	if err != nil {
+		k.Logger().WithError(err).Errorf("setIPTables request to agent failed")
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "SetIPTablesRequest timed out")
+		}
+	}
+
+	return err
+}
+
+func (k *kataAgent) getGuestVolumeStats(ctx context.Context, volumeGuestPath string) ([]byte, error) {
+	result, err := k.sendReq(ctx, &grpc.VolumeStatsRequest{VolumeGuestPath: volumeGuestPath})
+	if err != nil {
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return nil, status.Errorf(codes.DeadlineExceeded, "VolumeStatsRequest timed out")
+		}
+		return nil, err
+	}
+
+	buf, err := json.Marshal(result.(*grpc.VolumeStatsResponse))
+	if err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
+func (k *kataAgent) resizeGuestVolume(ctx context.Context, volumeGuestPath string, size uint64) error {
+	_, err := k.sendReq(ctx, &grpc.ResizeVolumeRequest{VolumeGuestPath: volumeGuestPath, Size: size})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "ResizeVolumeRequest timed out")
+	}
+	return err
+}
+
+func (k *kataAgent) setPolicy(ctx context.Context, policy string) error {
+	_, err := k.sendReq(ctx, &grpc.SetPolicyRequest{Policy: policy})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return status.Errorf(codes.DeadlineExceeded, "SetPolicyRequest timed out")
+	}
+	return err
+}
+
+// IsNydusRootFSType checks if the given mount type indicates Nydus is used.
+// By default, Nydus will use "fuse.nydus-overlayfs" as the mount type, but
+// we also accept binaries which have "nydus-overlayfs" prefix, so you can,
+// for example, place a nydus-overlayfs-abcde binary in the PATH and use
+// "fuse.nydus-overlayfs-abcde" as the mount type.
+// Further, we allow passing the full path to a Nydus binary as the mount type,
+// so "fuse./usr/local/bin/nydus-overlayfs" is also recognized.
+func IsNydusRootFSType(s string) bool {
+	if !strings.HasPrefix(s, "fuse.") {
+		return false
+	}
+	s = strings.TrimPrefix(s, "fuse.")
+	return strings.HasPrefix(path.Base(s), "nydus-overlayfs")
 }

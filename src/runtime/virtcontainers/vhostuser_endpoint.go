@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -11,9 +13,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
@@ -96,7 +98,7 @@ func (endpoint *VhostUserEndpoint) Attach(ctx context.Context, s *Sandbox) error
 		Type:       config.VhostUserNet,
 	}
 
-	return s.hypervisor.addDevice(ctx, d, vhostuserDev)
+	return s.hypervisor.AddDevice(ctx, d, VhostuserDev)
 }
 
 // Detach for vhostuser endpoint
@@ -105,12 +107,12 @@ func (endpoint *VhostUserEndpoint) Detach(ctx context.Context, netNsCreated bool
 }
 
 // HotAttach for vhostuser endpoint not supported yet
-func (endpoint *VhostUserEndpoint) HotAttach(ctx context.Context, h hypervisor) error {
+func (endpoint *VhostUserEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
 	return fmt.Errorf("VhostUserEndpoint does not support Hot attach")
 }
 
 // HotDetach for vhostuser endpoint not supported yet
-func (endpoint *VhostUserEndpoint) HotDetach(ctx context.Context, h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *VhostUserEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
 	return fmt.Errorf("VhostUserEndpoint does not support Hot detach")
 }
 
@@ -133,7 +135,7 @@ func findVhostUserNetSocketPath(netInfo NetworkInfo) (string, error) {
 		return "", nil
 	}
 
-	// check for socket file existence at known location.
+	// Check for socket file existence at known location.
 	for _, addr := range netInfo.Addrs {
 		socketPath := fmt.Sprintf(hostSocketSearchPath, addr.IPNet.IP)
 		if _, err := os.Stat(socketPath); err == nil {
@@ -146,7 +148,8 @@ func findVhostUserNetSocketPath(netInfo NetworkInfo) (string, error) {
 
 // vhostUserSocketPath returns the path of the socket discovered.  This discovery
 // will vary depending on the type of vhost-user socket.
-//  Today only VhostUserNetDevice is supported.
+//
+//	Today only VhostUserNetDevice is supported.
 func vhostUserSocketPath(info interface{}) (string, error) {
 
 	switch v := info.(type) {

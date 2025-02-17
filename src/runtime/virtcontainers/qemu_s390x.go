@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 IBM
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -10,8 +12,8 @@ import (
 	"fmt"
 	"time"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/sirupsen/logrus"
@@ -36,23 +38,13 @@ const (
 )
 
 // Verify needed parameters
-var kernelParams = []Param{
-	{"console", "ttysclp0"},
-}
+var kernelParams = []Param{}
 
 var ccwbridge = types.NewBridge(types.CCW, "", make(map[uint32]string, types.CCWBridgeMaxCapacity), 0)
 
 var supportedQemuMachine = govmmQemu.Machine{
 	Type:    QemuCCWVirtio,
 	Options: defaultQemuMachineOptions,
-}
-
-// MaxQemuVCPUs returns the maximum number of vCPUs supported
-func MaxQemuVCPUs() uint32 {
-	// Max number of virtual Cpu defined in qemu. See
-	// https://github.com/qemu/qemu/blob/80422b00196a7af4c6efb628fae0ad8b644e98af/target/s390x/cpu.h#L55
-	// #define S390_MAX_CPUS 248
-	return uint32(248)
 }
 
 func newQemuArch(config HypervisorConfig) (qemuArch, error) {
@@ -73,6 +65,7 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 			kernelParamsNonDebug: kernelParamsNonDebug,
 			kernelParamsDebug:    kernelParamsDebug,
 			kernelParams:         kernelParams,
+			legacySerial:         false,
 		},
 	}
 	// Set first bridge type to CCW
@@ -82,10 +75,19 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 		if err := q.enableProtection(); err != nil {
 			return nil, err
 		}
+
+		if !q.qemuArchBase.disableNvdimm {
+			hvLogger.WithField("subsystem", "qemuS390x").Warn("Nvdimm is not supported with confidential guest, disabling it.")
+			q.qemuArchBase.disableNvdimm = true
+		}
 	}
 
 	if config.ImagePath != "" {
-		q.kernelParams = append(q.kernelParams, commonVirtioblkKernelRootParams...)
+		kernelParams, err := GetKernelRootParams(config.RootfsType, true, false)
+		if err != nil {
+			return nil, err
+		}
+		q.kernelParams = append(q.kernelParams, kernelParams...)
 		q.kernelParamsNonDebug = append(q.kernelParamsNonDebug, kernelParamsSystemdNonDebug...)
 		q.kernelParamsDebug = append(q.kernelParamsDebug, kernelParamsSystemdDebug...)
 	}
@@ -111,6 +113,8 @@ func (q *qemuS390x) appendConsole(ctx context.Context, devices []govmmQemu.Devic
 	if err != nil {
 		return devices, fmt.Errorf("Failed to append console %v", err)
 	}
+
+	q.kernelParams = append(q.kernelParams, Param{"console", "ttysclp0"})
 
 	serial := govmmQemu.SerialDevice{
 		Driver:        virtioSerialCCW,
@@ -256,11 +260,6 @@ func (q *qemuS390x) append9PVolume(ctx context.Context, devices []govmmQemu.Devi
 	return devices, nil
 }
 
-// appendBridges appends to devices the given bridges
-func (q *qemuS390x) appendBridges(devices []govmmQemu.Device) []govmmQemu.Device {
-	return genericAppendBridges(devices, q.Bridges, q.qemuMachine.Type)
-}
-
 func (q *qemuS390x) appendSCSIController(ctx context.Context, devices []govmmQemu.Device, enableIOThreads bool) ([]govmmQemu.Device, *govmmQemu.IOThread, error) {
 	d, t := genericSCSIController(enableIOThreads, q.nestedRun)
 	addr, b, err := q.addDeviceToBridge(ctx, d.ID, types.CCW)
@@ -329,7 +328,7 @@ func (q *qemuS390x) enableProtection() error {
 		q.qemuMachine.Options += ","
 	}
 	q.qemuMachine.Options += fmt.Sprintf("confidential-guest-support=%s", secExecID)
-	virtLog.WithFields(logrus.Fields{
+	hvLogger.WithFields(logrus.Fields{
 		"subsystem": logSubsystem,
 		"machine":   q.qemuMachine}).
 		Info("Enabling guest protection with Secure Execution")
@@ -338,7 +337,7 @@ func (q *qemuS390x) enableProtection() error {
 
 // appendProtectionDevice appends a QEMU object for Secure Execution.
 // Takes devices and returns updated version. Takes BIOS and returns it (no modification on s390x).
-func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware string) ([]govmmQemu.Device, string, error) {
+func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
 	switch q.protection {
 	case seProtection:
 		return append(devices,
@@ -351,4 +350,33 @@ func (q *qemuS390x) appendProtectionDevice(devices []govmmQemu.Device, firmware 
 	default:
 		return devices, firmware, fmt.Errorf("Unsupported guest protection technology: %v", q.protection)
 	}
+}
+
+func (q *qemuS390x) appendVFIODevice(devices []govmmQemu.Device, vfioDev config.VFIODev) []govmmQemu.Device {
+	if vfioDev.SysfsDev == "" {
+		return devices
+	}
+
+	if len(vfioDev.APDevices) > 0 {
+		devices = append(devices,
+			govmmQemu.VFIODevice{
+				SysfsDev:  vfioDev.SysfsDev,
+				Transport: govmmQemu.TransportAP,
+			},
+		)
+		return devices
+
+	}
+	devices = append(devices,
+		govmmQemu.VFIODevice{
+			SysfsDev: vfioDev.SysfsDev,
+		},
+	)
+	return devices
+}
+
+// Query QMP to find a device's PCI path given its QOM path or ID
+func (q *qemuS390x) qomGetPciPath(qemuID string, qmpCh *qmpChannel) (types.PciPath, error) {
+	hvLogger.Warnf("qomGetPciPath not implemented for s390x")
+	return types.PciPath{}, nil
 }

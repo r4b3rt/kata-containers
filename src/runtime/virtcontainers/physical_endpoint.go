@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -8,16 +10,15 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	resCtrl "github.com/kata-containers/kata-containers/src/runtime/pkg/resourcecontrol"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cgroups"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/safchain/ethtool"
 )
 
@@ -88,7 +89,7 @@ func (endpoint *PhysicalEndpoint) Attach(ctx context.Context, s *Sandbox) error 
 		return err
 	}
 
-	c, err := cgroups.DeviceToCgroupDeviceRule(vfioPath)
+	c, err := resCtrl.DeviceToCgroupDeviceRule(vfioPath)
 	if err != nil {
 		return err
 	}
@@ -99,6 +100,7 @@ func (endpoint *PhysicalEndpoint) Attach(ctx context.Context, s *Sandbox) error 
 		Major:         c.Major,
 		Minor:         c.Minor,
 		ColdPlug:      true,
+		Port:          s.config.HypervisorConfig.ColdPlugVFIO,
 	}
 
 	_, err = s.AddDevice(ctx, d)
@@ -121,13 +123,65 @@ func (endpoint *PhysicalEndpoint) Detach(ctx context.Context, netNsCreated bool,
 }
 
 // HotAttach for physical endpoint not supported yet
-func (endpoint *PhysicalEndpoint) HotAttach(ctx context.Context, h hypervisor) error {
-	return fmt.Errorf("PhysicalEndpoint does not support Hot attach")
+func (endpoint *PhysicalEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
+	span, ctx := physicalTrace(ctx, "HotAttach", endpoint)
+	defer span.End()
+
+	// Unbind physical interface from host driver and bind to vfio
+	// so that it can be passed to the hypervisor.
+	vfioPath, err := bindNICToVFIO(endpoint)
+	if err != nil {
+		return err
+	}
+
+	c, err := resCtrl.DeviceToCgroupDeviceRule(vfioPath)
+	if err != nil {
+		return err
+	}
+
+	d := config.DeviceInfo{
+		ContainerPath: vfioPath,
+		DevType:       string(c.Type),
+		Major:         c.Major,
+		Minor:         c.Minor,
+		ColdPlug:      false,
+	}
+
+	_, err = s.AddDevice(ctx, d)
+	return err
 }
 
 // HotDetach for physical endpoint not supported yet
-func (endpoint *PhysicalEndpoint) HotDetach(ctx context.Context, h hypervisor, netNsCreated bool, netNsPath string) error {
-	return fmt.Errorf("PhysicalEndpoint does not support Hot detach")
+func (endpoint *PhysicalEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
+	span, _ := physicalTrace(ctx, "HotDetach", endpoint)
+	defer span.End()
+
+	var vfioPath string
+	var err error
+
+	if vfioPath, err = drivers.GetVFIODevPath(endpoint.BDF); err != nil {
+		return err
+	}
+
+	c, err := resCtrl.DeviceToCgroupDeviceRule(vfioPath)
+	if err != nil {
+		return err
+	}
+
+	d := config.DeviceInfo{
+		ContainerPath: vfioPath,
+		DevType:       string(c.Type),
+		Major:         c.Major,
+		Minor:         c.Minor,
+		ColdPlug:      false,
+	}
+
+	device := s.devManager.FindDevice(&d)
+	s.devManager.RemoveDevice(device.DeviceID())
+
+	// We do not need to enter the network namespace to bind back the
+	// physical interface to host driver.
+	return bindNICToHost(endpoint)
 }
 
 // isPhysicalIface checks if an interface is a physical device.
@@ -185,7 +239,7 @@ func createPhysicalEndpoint(netInfo NetworkInfo) (*PhysicalEndpoint, error) {
 	// Get vendor and device id from pci space (sys/bus/pci/devices/$bdf)
 
 	ifaceDevicePath := filepath.Join(sysPCIDevicesPath, bdf, "device")
-	contents, err := ioutil.ReadFile(ifaceDevicePath)
+	contents, err := os.ReadFile(ifaceDevicePath)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +248,7 @@ func createPhysicalEndpoint(netInfo NetworkInfo) (*PhysicalEndpoint, error) {
 
 	// Vendor id
 	ifaceVendorPath := filepath.Join(sysPCIDevicesPath, bdf, "vendor")
-	contents, err = ioutil.ReadFile(ifaceVendorPath)
+	contents, err = os.ReadFile(ifaceVendorPath)
 	if err != nil {
 		return nil, err
 	}
@@ -216,11 +270,11 @@ func createPhysicalEndpoint(netInfo NetworkInfo) (*PhysicalEndpoint, error) {
 }
 
 func bindNICToVFIO(endpoint *PhysicalEndpoint) (string, error) {
-	return drivers.BindDevicetoVFIO(endpoint.BDF, endpoint.Driver, endpoint.VendorDeviceID)
+	return drivers.BindDevicetoVFIO(endpoint.BDF, endpoint.Driver)
 }
 
 func bindNICToHost(endpoint *PhysicalEndpoint) error {
-	return drivers.BindDevicetoHost(endpoint.BDF, endpoint.Driver, endpoint.VendorDeviceID)
+	return drivers.BindDevicetoHost(endpoint.BDF, endpoint.Driver)
 }
 
 func (endpoint *PhysicalEndpoint) save() persistapi.NetworkEndpoint {

@@ -6,7 +6,6 @@
 package virtcontainers
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net"
@@ -30,17 +29,35 @@ var virtiofsdTracingTags = map[string]string{
 }
 
 var (
-	errVirtiofsdDaemonPathEmpty    = errors.New("virtiofsd daemon path is empty")
-	errVirtiofsdSocketPathEmpty    = errors.New("virtiofsd socket path is empty")
-	errVirtiofsdSourcePathEmpty    = errors.New("virtiofsd source path is empty")
-	errVirtiofsdSourceNotAvailable = errors.New("virtiofsd source path not available")
+	errVirtiofsdDaemonPathEmpty          = errors.New("virtiofsd daemon path is empty")
+	errVirtiofsdSocketPathEmpty          = errors.New("virtiofsd socket path is empty")
+	errVirtiofsdSourcePathEmpty          = errors.New("virtiofsd source path is empty")
+	errVirtiofsdInvalidVirtiofsCacheMode = func(mode string) error { return errors.Errorf("Invalid virtio-fs cache mode: %s", mode) }
+	errVirtiofsdSourceNotAvailable       = errors.New("virtiofsd source path not available")
+	errUnimplemented                     = errors.New("unimplemented")
 )
 
-type Virtiofsd interface {
-	// Start virtiofsd, return pid of virtiofsd process
+const (
+	typeVirtioFSCacheModeNever  = "never"
+	typeVirtioFSCacheModeAlways = "always"
+	typeVirtioFSCacheModeAuto   = "auto"
+)
+
+type VirtiofsDaemon interface {
+	// Start virtiofs daemon, return pid of virtiofs daemon process
 	Start(context.Context, onQuitFunc) (pid int, err error)
-	// Stop virtiofsd process
+	// Stop virtiofs daemon process
 	Stop(context.Context) error
+	// Add a submount rafs to the virtiofs mountpoint
+	Mount(opt MountOption) error
+	// Umount a submount rafs from the virtiofs mountpoint
+	Umount(mountpoint string) error
+}
+
+type MountOption struct {
+	source     string
+	mountpoint string
+	config     string
 }
 
 // Helper function to execute when virtiofsd quit
@@ -53,14 +70,12 @@ type virtiofsd struct {
 	path string
 	// socketPath where daemon will serve
 	socketPath string
-	// cache size for virtiofsd
+	// cache mode for virtiofsd
 	cache string
 	// sourcePath path that daemon will help to share
 	sourcePath string
 	// extraArgs list of extra args to append to virtiofsd command
 	extraArgs []string
-	// debug flag
-	debug bool
 	// PID process ID of virtiosd process
 	PID int
 }
@@ -76,6 +91,12 @@ func (v *virtiofsd) getSocketFD() (*os.File, error) {
 
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: v.socketPath, Net: "unix"})
 	if err != nil {
+		return nil, err
+	}
+
+	// Need to change the filesystem ownership of the socket because virtiofsd runs as root while qemu can run as non-root.
+	// This can be removed once virtiofsd can also run as non-root (https://github.com/kata-containers/kata-containers/issues/2542)
+	if err := utils.ChownToParent(v.socketPath); err != nil {
 		return nil, err
 	}
 
@@ -119,24 +140,14 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 
 	v.Logger().WithField("path", v.path).Info()
 	v.Logger().WithField("args", strings.Join(args, " ")).Info()
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return pid, err
-	}
 
 	if err = utils.StartCmd(cmd); err != nil {
 		return pid, err
 	}
 
-	// Monitor virtiofsd's stderr and stop sandbox if virtiofsd quits
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			v.Logger().WithField("source", "virtiofsd").Info(scanner.Text())
-		}
-		v.Logger().Info("virtiofsd quits")
-		// Wait to release resources of virtiofsd process
 		cmd.Process.Wait()
+		v.Logger().Info("virtiofsd quits")
 		if onQuit != nil {
 			onQuit()
 		}
@@ -149,6 +160,7 @@ func (v *virtiofsd) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 
 func (v *virtiofsd) Stop(ctx context.Context) error {
 	if err := v.kill(ctx); err != nil {
+		v.Logger().WithError(err).WithField("pid", v.PID).Warn("kill virtiofsd failed")
 		return nil
 	}
 
@@ -159,28 +171,25 @@ func (v *virtiofsd) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (v *virtiofsd) Mount(opt MountOption) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsd) Umount(mountpoint string) error {
+	return errUnimplemented
+}
+
 func (v *virtiofsd) args(FdSocketNumber uint) ([]string, error) {
 
 	args := []string{
 		// Send logs to syslog
 		"--syslog",
 		// cache mode for virtiofsd
-		"-o", "cache=" + v.cache,
-		// disable posix locking in daemon: bunch of basic posix locks properties are broken
-		// apt-get update is broken if enabled
-		"-o", "no_posix_lock",
+		"--cache=" + v.cache,
 		// shared directory tree
-		"-o", "source=" + v.sourcePath,
+		"--shared-dir=" + v.sourcePath,
 		// fd number of vhost-user socket
 		fmt.Sprintf("--fd=%v", FdSocketNumber),
-	}
-
-	if v.debug {
-		// enable debug output (implies -f)
-		args = append(args, "-d")
-	} else {
-		// foreground operation
-		args = append(args, "-f")
 	}
 
 	if len(v.extraArgs) != 0 {
@@ -206,11 +215,18 @@ func (v *virtiofsd) valid() error {
 	if _, err := os.Stat(v.sourcePath); err != nil {
 		return errVirtiofsdSourceNotAvailable
 	}
+
+	if v.cache == "" {
+		v.cache = typeVirtioFSCacheModeAuto
+	} else if v.cache != typeVirtioFSCacheModeAuto && v.cache != typeVirtioFSCacheModeAlways && v.cache != typeVirtioFSCacheModeNever {
+		return errVirtiofsdInvalidVirtiofsCacheMode(v.cache)
+	}
+
 	return nil
 }
 
 func (v *virtiofsd) Logger() *log.Entry {
-	return virtLog.WithField("subsystem", "virtiofsd")
+	return hvLogger.WithField("subsystem", "virtiofsd")
 }
 
 func (v *virtiofsd) kill(ctx context.Context) (err error) {
@@ -226,7 +242,6 @@ func (v *virtiofsd) kill(ctx context.Context) (err error) {
 	if err != nil {
 		v.PID = 0
 	}
-
 	return err
 }
 
@@ -237,6 +252,14 @@ type virtiofsdMock struct {
 // Start the virtiofsd daemon
 func (v *virtiofsdMock) Start(ctx context.Context, onQuit onQuitFunc) (int, error) {
 	return 9999999, nil
+}
+
+func (v *virtiofsdMock) Mount(opt MountOption) error {
+	return errUnimplemented
+}
+
+func (v *virtiofsdMock) Umount(mountpoint string) error {
+	return errUnimplemented
 }
 
 func (v *virtiofsdMock) Stop(ctx context.Context) error {

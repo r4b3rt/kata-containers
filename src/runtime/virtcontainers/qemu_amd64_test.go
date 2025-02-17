@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -8,12 +10,11 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/intel-go/cpuid"
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -41,14 +42,17 @@ func TestQemuAmd64BadMachineType(t *testing.T) {
 
 func TestQemuAmd64Capabilities(t *testing.T) {
 	assert := assert.New(t)
+	config := HypervisorConfig{}
 
 	amd64 := newTestQemu(assert, QemuQ35)
-	caps := amd64.capabilities()
+	caps := amd64.capabilities(config)
 	assert.True(caps.IsBlockDeviceHotplugSupported())
+	assert.True(caps.IsNetworkDeviceHotplugSupported())
 
 	amd64 = newTestQemu(assert, QemuMicrovm)
-	caps = amd64.capabilities()
+	caps = amd64.capabilities(config)
 	assert.False(caps.IsBlockDeviceHotplugSupported())
+	assert.False(caps.IsNetworkDeviceHotplugSupported())
 }
 
 func TestQemuAmd64Bridges(t *testing.T) {
@@ -85,7 +89,7 @@ func TestQemuAmd64CPUModel(t *testing.T) {
 	base, ok := amd64.(*qemuAmd64)
 	assert.True(ok)
 	base.vmFactory = true
-	expectedOut = defaultCPUModel + ",vmx=off"
+	expectedOut = defaultCPUModel
 	model = amd64.cpuModel()
 	assert.Equal(expectedOut, model)
 }
@@ -111,7 +115,7 @@ func TestQemuAmd64MemoryTopology(t *testing.T) {
 func TestQemuAmd64AppendImage(t *testing.T) {
 	assert := assert.New(t)
 
-	f, err := ioutil.TempFile("", "img")
+	f, err := os.CreateTemp("", "img")
 	assert.NoError(err)
 	defer func() { _ = f.Close() }()
 	defer func() { _ = os.Remove(f.Name()) }()
@@ -119,7 +123,7 @@ func TestQemuAmd64AppendImage(t *testing.T) {
 	imageStat, err := f.Stat()
 	assert.NoError(err)
 
-	// save default supportedQemuMachines options
+	// Save default supportedQemuMachines options
 	machinesCopy := make([]govmmQemu.Machine, len(supportedQemuMachines))
 	assert.Equal(len(supportedQemuMachines), copy(machinesCopy, supportedQemuMachines))
 
@@ -187,12 +191,15 @@ func TestQemuAmd64AppendBridges(t *testing.T) {
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.BridgeDevice{
-			Type:    govmmQemu.PCIBridge,
-			Bus:     defaultBridgeBus,
-			ID:      bridges[0].ID,
-			Chassis: 1,
-			SHPC:    true,
-			Addr:    "2",
+			Type:          govmmQemu.PCIBridge,
+			Bus:           defaultBridgeBus,
+			ID:            bridges[0].ID,
+			Chassis:       1,
+			SHPC:          false,
+			Addr:          "2",
+			IOReserve:     "4k",
+			MemReserve:    "1m",
+			Pref64Reserve: "1m",
 		},
 	}
 
@@ -250,7 +257,7 @@ func TestQemuAmd64AppendProtectionDevice(t *testing.T) {
 	firmware := "tdvf.fd"
 	var bios string
 	var err error
-	devices, bios, err = amd64.appendProtectionDevice(devices, firmware)
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
 	assert.NoError(err)
 
 	// non-protection
@@ -258,20 +265,20 @@ func TestQemuAmd64AppendProtectionDevice(t *testing.T) {
 
 	// pef protection
 	amd64.(*qemuAmd64).protection = pefProtection
-	devices, bios, err = amd64.appendProtectionDevice(devices, firmware)
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// Secure Execution protection
 	amd64.(*qemuAmd64).protection = seProtection
-	devices, bios, err = amd64.appendProtectionDevice(devices, firmware)
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// sev protection
 	amd64.(*qemuAmd64).protection = sevProtection
 
-	devices, bios, err = amd64.appendProtectionDevice(devices, firmware)
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
 	assert.NoError(err)
 	assert.Empty(bios)
 
@@ -282,16 +289,36 @@ func TestQemuAmd64AppendProtectionDevice(t *testing.T) {
 			Debug:           false,
 			File:            firmware,
 			CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
-			ReducedPhysBits: cpuid.AMDMemEncrypt.PhysAddrReduction,
+			ReducedPhysBits: 1,
 		},
 	}
+
+	assert.Equal(expectedOut, devices)
+
+	// snp protection
+	amd64.(*qemuAmd64).protection = snpProtection
+
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
+	assert.NoError(err)
+	assert.Empty(bios)
+
+	expectedOut = append(expectedOut,
+		govmmQemu.Object{
+			Type:            govmmQemu.SNPGuest,
+			ID:              "snp",
+			Debug:           false,
+			File:            firmware,
+			CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
+			ReducedPhysBits: 1,
+		},
+	)
 
 	assert.Equal(expectedOut, devices)
 
 	// tdxProtection
 	amd64.(*qemuAmd64).protection = tdxProtection
 
-	devices, bios, err = amd64.appendProtectionDevice(devices, firmware)
+	devices, bios, err = amd64.appendProtectionDevice(devices, firmware, "")
 	assert.NoError(err)
 	assert.Empty(bios)
 

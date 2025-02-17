@@ -1,47 +1,38 @@
-# Kata Agent in Rust
+# Kata Agent
 
-This is a rust version of the [`kata-agent`](https://github.com/kata-containers/agent).
+## Overview
 
-In Denver PTG, [we discussed about re-writing agent in rust](https://etherpad.openstack.org/p/katacontainers-2019-ptg-denver-agenda):
+The Kata agent is a long running process that runs inside the Virtual Machine
+(VM) (also known as the "pod" or "sandbox").
 
-> In general, we all think about re-write agent in rust to reduce the footprint of agent. Moreover, Eric mentioned the possibility to stop using gRPC, which may have some impact on footprint. We may begin to do some POC to show how much we could save by re-writing agent in rust.
+The agent is packaged inside the Kata Containers
+[guest image](../../docs/design/architecture/README.md#guest-image)
+which is used to boot the VM. Once the runtime has launched the configured
+[hypervisor](../../docs/hypervisors.md) to create a new VM, the agent is
+started. From this point on, the agent is responsible for creating and
+managing the life cycle of the containers inside the VM.
 
-After that, we drafted the initial code here, and any contributions are welcome.
+For further details, see the
+[architecture document](../../docs/design/architecture).
 
-## Features
+## Audience
 
-| Feature | Status |
-| :--|:--:|
-| **OCI Behaviors** |
-| create/start containers | :white_check_mark: |
-| signal/wait process     | :white_check_mark: |
-| exec/list process       | :white_check_mark: |
-| I/O stream              | :white_check_mark: |
-| Cgroups                 | :white_check_mark: |
-| Capabilities, `rlimit`, readonly path, masked path, users | :white_check_mark: |
-| container stats (`stats_container`)                     | :white_check_mark: |
-| Hooks                   | :white_check_mark: |
-| **Agent Features & APIs** |
-| run agent as `init` (mount fs, udev, setup `lo`) | :white_check_mark: |
-| block device as root device                      | :white_check_mark: |
-| Health API                                       | :white_check_mark: |
-| network, interface/routes (`update_container`)   | :white_check_mark: |
-| File transfer API (`copy_file`)                  | :white_check_mark: |
-| Device APIs (`reseed_random_device`, , `online_cpu_memory`, `mem_hotplug_probe`, `set_guet_data_time`) | :white_check_mark: |
-| VSOCK support                                    | :white_check_mark: |
-| virtio-serial support                            | :heavy_multiplication_x: |
-| OCI Spec validator                               | :white_check_mark: |
-| **Infrastructures**|
-| Debug Console | :white_check_mark: |
-| Command line  | :white_check_mark: |
-| Tracing       | :heavy_multiplication_x: |
+If you simply wish to use Kata Containers, it is not necessary to understand
+the details of how the agent operates. Please see the
+[installation documentation](../../docs/install) for details of how deploy
+Kata Containers (which will include the Kata agent).
 
-## Getting Started
+The remainder of this document is only useful for developers and testers.
 
-### Build from Source
-The rust-agent needs to be built statically and linked with `musl`
+## Build from Source
 
-> **Note:** skip this step for ppc64le, the build scripts explicitly use gnu for ppc64le.
+Since the agent is written in the Rust language this section assumes the tool
+chain has been installed using standard Rust `rustup` tool.
+
+### Build with musl
+
+If you wish to build the agent with the `musl` C library, you need to run the
+following commands:
 
 ```bash
 $ arch=$(uname -m)
@@ -49,12 +40,15 @@ $ rustup target add "${arch}-unknown-linux-musl"
 $ sudo ln -s /usr/bin/g++ /bin/musl-g++
 ```
 
-ppc64le-only: Manually install `protoc`, e.g.
-```bash
-$ sudo dnf install protobuf-compiler
-```
+> **Note:**
+>
+> It is not currently possible to build using `musl` on ppc64le and s390x
+> since both platforms lack the `musl` target.
 
-Download the source files in the Kata containers repository and build the agent:
+### Build the agent binary
+
+The following steps download the Kata Containers source files and build the agent:
+
 ```bash
 $ GOPATH="${GOPATH:-$HOME/go}"
 $ dir="$GOPATH/src/github.com/kata-containers"
@@ -62,17 +56,109 @@ $ git -C ${dir} clone --depth 1 https://github.com/kata-containers/kata-containe
 $ make -C ${dir}/kata-containers/src/agent
 ```
 
-## Run Kata CI with rust-agent
-   * Firstly, install Kata as noted by ["how to install Kata"](../../docs/install/README.md)
-   * Secondly, build your own Kata initrd/image following the steps in ["how to build your own initrd/image"](../../docs/Developer-Guide.md#create-and-install-rootfs-and-initrd-image).
-notes: Please use your rust agent instead of the go agent when building your initrd/image.
-   * Clone the Kata CI test cases from: https://github.com/kata-containers/tests.git, and then run the CRI test with: 
+## Change the agent API
+
+The Kata runtime communicates with the Kata agent using a ttRPC based API protocol.
+
+This ttRPC API is defined by a set of [protocol buffers files](../libs/protocols/protos).
+The protocol files are used to generate the bindings for the following components:
+
+| Component | Language | Generation method `[*]` | Tooling required |
+|-|-|-|-|
+| runtime | Golang | Run, `make generate-protocols` | `protoc` |
+| agent | Rust | Run, `make` |  |
+
+> **Key:**
+>
+> `[*]` - All commands must be run in the agent repository.
+
+If you wish to change the API, these files must be regenerated. Although the
+rust code will be automatically generated by the
+[build script](../libs/protocols/build.rs),
+the Golang code generation requires the external `protoc` command to be
+available in `$PATH`.
+
+To install the `protoc` command on a Fedora/CentOS/RHEL system:
 
 ```bash
-$sudo -E PATH=$PATH -E GOPATH=$GOPATH integration/containerd/shimv2/shimv2-tests.sh
+$ sudo dnf install -y protobuf-compiler
 ```
 
-## Mini Benchmark
-The memory of `RssAnon` consumed by the go-agent and rust-agent as below:
-go-agent: about 11M
-rust-agent: about 1.1M
+## Custom guest image and kernel assets
+
+If you wish to develop or test changes to the agent, you will need to create a
+custom guest image using the [osbuilder tool](../../tools/osbuilder). You
+may also wish to create a custom [guest kernel](../../tools/packaging/kernel).
+
+Once created, [configure](../runtime/README.md#configuration) Kata Containers to use
+these custom assets to allow you to test your changes.
+
+> **Note:**
+>
+> To simplify development and testing, you may wish to run the agent
+> [stand alone](#run-the-agent-stand-alone) initially.
+
+## Tracing
+
+For details of tracing the operation of the agent, see the
+[tracing documentation](/docs/tracing.md).
+
+## Run the agent stand alone
+
+Although the agent is designed to run in a VM environment, for development and
+testing purposes it is possible to run it as a normal application.
+
+When run in this way, the agent can be controlled using the low-level Kata
+agent control tool, rather than the Kata runtime.
+
+For further details, see the
+[agent control tool documentation](../tools/agent-ctl/README.md#run-the-tool-and-the-agent-in-the-same-environment).
+
+## Agent options
+
+The kata agent has the ability to configure agent options in guest kernel command line at runtime. Currently, the following agent options can be configured:
+
+| Option | Name | Description  | Type | Default |
+|-|-|:-:|:-:|:-:|
+| `agent.config_file` | `Configuration file` | Allow to configure options through a configuration file from the root filesystem | string | `""` |
+| `agent.container_pipe_size` | `Container pipe sizes` | Allow to configure the stdout or stderr pipe sizes | integer | `0` |
+| `agent.debug_console` | Debug console flag | Allow to connect guest OS running inside hypervisor Connect using `kata-runtime exec <sandbox-id>` | boolean | `false` |
+| `agent.debug_console_vport` | Debug console port | Allow to specify the `vsock` port to connect the debugging console | integer | `0` |
+| `agent.devmode` | Developer mode | Allow the agent process to coredump | boolean | `false` |
+| `agent.guest_components_rest_api` | `api-server-rest` configuration | Select the features that the API Server Rest attestation component will run with. Valid values are `all`, `attestation`, `resource` | string | `resource` |
+| `agent.guest_components_procs` | guest-components processes | Attestation-related processes that should be spawned as children of the guest. Valid values are `none`, `attestation-agent`, `confidential-data-hub` (implies `attestation-agent`), `api-server-rest` (implies `attestation-agent` and `confidential-data-hub`) | string | `api-server-rest` |
+| `agent.hotplug_timeout` | Hotplug timeout | Allow to configure hotplug timeout(seconds) of block devices | integer | `3` |
+| `agent.cdh_api_timeout` | Confidential Data Hub (CDH) API timeout | Allow to configure CDH API timeout(seconds) | integer | `50` |
+| `agent.https_proxy` | HTTPS proxy | Allow to configure `https_proxy` in the guest | string | `""` |
+| `agent.image_registry_auth` | Image registry credential URI | The URI to where image-rs can find the credentials for pulling images from private registries e.g. `file:///root/.docker/config.json` to read from a file in the guest image, or `kbs:///default/credentials/test` to get the file from the KBS| string | `""` |
+| `agent.enable_signature_verification` | Image security policy flag | Whether enable image security policy enforcement. If `true`, the resource indexed by URI `agent.image_policy_file` will be got to work as image pulling policy. | string | `""` |
+| `agent.image_policy_file` | Image security policy URI | The URI to where image-rs Typical policy URIs are like `file:///etc/image.json` to read from a file in the guest image, or `kbs:///default/security-policy/test` to get the file from the KBS| string | `""` |
+| `agent.log` | Log level | Allow the agent log level to be changed (produces more or less output) | string | `"info"` |
+| `agent.log_vport` | Log port | Allow to specify the `vsock` port to read logs | integer | `0` |
+| `agent.no_proxy` | NO proxy | Allow to configure `no_proxy` in the guest | string | `""` |
+| `agent.passfd_listener_port` | File descriptor passthrough IO listener port | Allow to set the file descriptor passthrough IO listener port | integer | `0` |
+| `agent.secure_image_storage_integrity` | Image storage integrity | Allow to use `dm-integrity` to protect the integrity of encrypted block volume | boolean | `false` |
+| `agent.server_addr` | Server address | Allow the ttRPC server address to be specified | string | `"vsock://-1:1024"` |
+| `agent.trace` | Trace mode | Allow to static tracing | boolean | `false` |
+| `systemd.unified_cgroup_hierarchy` | `Cgroup hierarchy` | Allow to setup v2 cgroups | boolean | `false` |
+
+> **Note:** Accepted values for some agent options
+>  - `agent.config_file`: If we enable `agent.config_file` in guest kernel command line,
+>    we will generate the agent config from it.
+>    The agent will fail to start if the configuration file is not present,
+>    or if it can't be parsed properly.
+>  - `agent.devmode`: true | false
+>  - `agent.hotplug_timeout` and `agent.cdh_api_timeout`: a whole number of seconds
+>  - `agent.log`:   "critical"("fatal" | "panic") | "error" | "warn"("warning") | "info" | "debug"
+>  - `agent.server_addr`: "{VSOCK_ADDR}:{VSOCK_PORT}"
+>  - `agent.trace`: true | false
+>  - `systemd.unified_cgroup_hierarchy`: true | false
+
+For instance, you can enable the debug console and set the agent log level to debug by configuring the guest kernel command line in the configuration file:
+```toml
+kernel_params = "agent.debug_console agent.log=debug agent.hotplug_timeout=10"
+```
+results in:
+```bash
+{"msg":"announce","level":"INFO","subsystem":"root","version":"0.1.0","pid":"214","source":"agent","name":"kata-agent","config":"AgentConfig { debug_console: true, dev_mode: false, log_level: Debug, hotplug_timeout: 10s, debug_console_vport: 0, log_vport: 0, container_pipe_size: 0, server_addr: "vsock://-1:1024", passfd_listener_port: 0, unified_cgroup_hierarchy: false, tracing: false, supports_seccomp: true }","agent-version":"3.3.0-alpha0"}
+```

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2019 Intel Corporation
 #
@@ -66,7 +66,7 @@ function run_test() {
     cmd="kubectl get pods | grep $busybox_pod | grep Completed"
     wait_time=120
 
-    configurations=("nginx-deployment-qemu" "nginx-deployment-clh")
+    configurations=("nginx-deployment-qemu" "nginx-deployment-clh" "nginx-deployment-dragonball")
     for deployment in "${configurations[@]}"; do
         # start the kata pod:
         kubectl apply -f "$YAMLPATH/examples/${deployment}.yaml"
@@ -75,7 +75,7 @@ function run_test() {
       # our 'wait' for deployment status will fail to find the deployment at all
       sleep 3 
 
-      kubectl wait --timeout=5m --for=condition=Available deployment/${deployment}
+      kubectl wait --timeout=5m --for=condition=Available deployment/${deployment} || kubectl describe pods
       kubectl expose deployment/${deployment}
 
       # test pod connectivity:
@@ -98,7 +98,6 @@ function test_kata() {
     [[ -z "$PKG_SHA" ]] && die "no PKG_SHA provided"
 
     YAMLPATH="./tools/packaging/kata-deploy/"
-    VERSION=$(cat ./VERSION)
 
     # This action could be called in two contexts:
     #  1. Packaging workflows: testing in packaging repository, where we assume yaml/packaging
@@ -120,8 +119,8 @@ function test_kata() {
     kubectl get runtimeclasses
 
     # update deployment daemonset to utilize the container under test:
-    sed -i "s#quay.io/kata-containers/kata-deploy:${VERSION}#quay.io/kata-containers/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-deploy/base/kata-deploy.yaml
-    sed -i "s#quay.io/kata-containers/kata-deploy:${VERSION}#quay.io/kata-containers/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-cleanup/base/kata-cleanup.yaml
+    sed -i "s#quay.io/kata-containers/kata-deploy:latest#quay.io/kata-containers/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-deploy/base/kata-deploy.yaml
+    sed -i "s#quay.io/kata-containers/kata-deploy:latest#quay.io/kata-containers/kata-deploy-ci:${PKG_SHA}#g" $YAMLPATH/kata-cleanup/base/kata-cleanup.yaml
 
     cat $YAMLPATH/kata-deploy/base/kata-deploy.yaml
 

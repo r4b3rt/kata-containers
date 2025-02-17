@@ -9,7 +9,7 @@ ROOTFS_BUILDER := $(MK_DIR)/rootfs-builder/rootfs.sh
 INITRD_BUILDER := $(MK_DIR)/initrd-builder/initrd_builder.sh
 IMAGE_BUILDER  := $(MK_DIR)/image-builder/image_builder.sh
 
-DISTRO                := centos
+DISTRO                ?= ubuntu
 BUILD_METHOD          := distro
 BUILD_METHOD_LIST     := distro dracut
 AGENT_INIT            ?= no
@@ -23,9 +23,9 @@ TARGET_IMAGE          := $(IMAGES_BUILD_DEST)/kata-containers.img
 TARGET_INITRD         := $(IMAGES_BUILD_DEST)/kata-containers-initrd.img
 
 VERSION_FILE   := ./VERSION
-VERSION        := $(shell grep -v ^\# $(VERSION_FILE))
-COMMIT_NO      := $(shell git rev-parse HEAD 2> /dev/null || true)
-COMMIT         := $(if $(shell git status --porcelain --untracked-files=no),${COMMIT_NO}-dirty,${COMMIT_NO})
+VERSION        := $(shell grep -v ^\# $(VERSION_FILE) 2>/dev/null || echo "unknown")
+COMMIT_NO      := $(shell git rev-parse HEAD 2>/dev/null || true)
+COMMIT         := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 VERSION_COMMIT := $(if $(COMMIT),$(VERSION)-$(COMMIT),$(VERSION))
 
 ifeq ($(filter $(BUILD_METHOD),$(BUILD_METHOD_LIST)),)
@@ -85,6 +85,9 @@ endif
 
 ################################################################################
 
+.PHONY: all
+all: image initrd
+
 rootfs-%: $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX)
 	@ # DONT remove. This is not cancellation rule.
 
@@ -97,11 +100,13 @@ $(ROOTFS_BUILD_DEST)/.%$(ROOTFS_MARKER_SUFFIX):: rootfs-builder/%
 # extract it in a local folder.
 # Notes:
 # - assuming a not compressed initrd.
+ifeq (dracut,$(BUILD_METHOD))
 .PRECIOUS: $(ROOTFS_BUILD_DEST)/.dracut$(ROOTFS_MARKER_SUFFIX)
 $(ROOTFS_BUILD_DEST)/.dracut$(ROOTFS_MARKER_SUFFIX): $(TARGET_INITRD)
 	mkdir -p $(TARGET_ROOTFS)
 	(cd $(TARGET_ROOTFS); cat $< | cpio --extract --preserve-modification-time --make-directories)
 	@touch $@
+endif
 
 image-%: $(IMAGES_BUILD_DEST)/kata-containers-image-%.img
 	@ # DONT remove. This is not cancellation rule.
@@ -116,9 +121,6 @@ initrd-%: $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img
 .PRECIOUS: $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img
 $(IMAGES_BUILD_DEST)/kata-containers-initrd-%.img: rootfs-%
 	$(call silent_run,Creating initrd image for $*,$(INITRD_BUILDER) -o $@ $(ROOTFS_BUILD_DEST)/$*_rootfs)
-
-.PHONY: all
-all: image initrd
 
 .PHONY: rootfs
 rootfs: $(TARGET_ROOTFS_MARKER)
@@ -182,7 +184,6 @@ SCRIPTS += image-builder/image_builder.sh
 SCRIPTS += initrd-builder/initrd_builder.sh
 
 HELPER_FILES :=
-HELPER_FILES += rootfs-builder/versions.txt
 HELPER_FILES += scripts/lib.sh
 HELPER_FILES += image-builder/nsdax.gpl.c
 
@@ -202,7 +203,7 @@ install-scripts:
 	@$(foreach f,$(SCRIPTS),$(call INSTALL_SCRIPT,$f,$(INSTALL_DIR)))
 	@echo "Installing helper files"
 	@$(foreach f,$(HELPER_FILES),$(call INSTALL_FILE,$f,$(INSTALL_DIR)))
-	@echo "Installing installing config files"
+	@echo "Installing config files"
 	@$(foreach f,$(DIST_CONFIGS),$(call INSTALL_FILE,$f,$(INSTALL_DIR)))
 
 .PHONY: clean

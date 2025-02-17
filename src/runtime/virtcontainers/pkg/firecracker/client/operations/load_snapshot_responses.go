@@ -10,10 +10,9 @@ import (
 	"io"
 
 	"github.com/go-openapi/runtime"
+	"github.com/go-openapi/strfmt"
 
-	strfmt "github.com/go-openapi/strfmt"
-
-	models "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
+	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/firecracker/client/models"
 )
 
 // LoadSnapshotReader is a Reader for the LoadSnapshot structure.
@@ -24,21 +23,18 @@ type LoadSnapshotReader struct {
 // ReadResponse reads a server response into the received o.
 func (o *LoadSnapshotReader) ReadResponse(response runtime.ClientResponse, consumer runtime.Consumer) (interface{}, error) {
 	switch response.Code() {
-
 	case 204:
 		result := NewLoadSnapshotNoContent()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return result, nil
-
 	case 400:
 		result := NewLoadSnapshotBadRequest()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
 			return nil, err
 		}
 		return nil, result
-
 	default:
 		result := NewLoadSnapshotDefault(response.Code())
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
@@ -56,14 +52,44 @@ func NewLoadSnapshotNoContent() *LoadSnapshotNoContent {
 	return &LoadSnapshotNoContent{}
 }
 
-/*LoadSnapshotNoContent handles this case with default header values.
+/*
+LoadSnapshotNoContent describes a response with status code 204, with default header values.
 
 Snapshot loaded
 */
 type LoadSnapshotNoContent struct {
 }
 
+// IsSuccess returns true when this load snapshot no content response has a 2xx status code
+func (o *LoadSnapshotNoContent) IsSuccess() bool {
+	return true
+}
+
+// IsRedirect returns true when this load snapshot no content response has a 3xx status code
+func (o *LoadSnapshotNoContent) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this load snapshot no content response has a 4xx status code
+func (o *LoadSnapshotNoContent) IsClientError() bool {
+	return false
+}
+
+// IsServerError returns true when this load snapshot no content response has a 5xx status code
+func (o *LoadSnapshotNoContent) IsServerError() bool {
+	return false
+}
+
+// IsCode returns true when this load snapshot no content response a status code equal to that given
+func (o *LoadSnapshotNoContent) IsCode(code int) bool {
+	return code == 204
+}
+
 func (o *LoadSnapshotNoContent) Error() string {
+	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshotNoContent ", 204)
+}
+
+func (o *LoadSnapshotNoContent) String() string {
 	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshotNoContent ", 204)
 }
 
@@ -77,7 +103,8 @@ func NewLoadSnapshotBadRequest() *LoadSnapshotBadRequest {
 	return &LoadSnapshotBadRequest{}
 }
 
-/*LoadSnapshotBadRequest handles this case with default header values.
+/*
+LoadSnapshotBadRequest describes a response with status code 400, with default header values.
 
 Snapshot cannot be loaded due to bad input
 */
@@ -85,8 +112,41 @@ type LoadSnapshotBadRequest struct {
 	Payload *models.Error
 }
 
+// IsSuccess returns true when this load snapshot bad request response has a 2xx status code
+func (o *LoadSnapshotBadRequest) IsSuccess() bool {
+	return false
+}
+
+// IsRedirect returns true when this load snapshot bad request response has a 3xx status code
+func (o *LoadSnapshotBadRequest) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this load snapshot bad request response has a 4xx status code
+func (o *LoadSnapshotBadRequest) IsClientError() bool {
+	return true
+}
+
+// IsServerError returns true when this load snapshot bad request response has a 5xx status code
+func (o *LoadSnapshotBadRequest) IsServerError() bool {
+	return false
+}
+
+// IsCode returns true when this load snapshot bad request response a status code equal to that given
+func (o *LoadSnapshotBadRequest) IsCode(code int) bool {
+	return code == 400
+}
+
 func (o *LoadSnapshotBadRequest) Error() string {
 	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshotBadRequest  %+v", 400, o.Payload)
+}
+
+func (o *LoadSnapshotBadRequest) String() string {
+	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshotBadRequest  %+v", 400, o.Payload)
+}
+
+func (o *LoadSnapshotBadRequest) GetPayload() *models.Error {
+	return o.Payload
 }
 
 func (o *LoadSnapshotBadRequest) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
@@ -108,7 +168,8 @@ func NewLoadSnapshotDefault(code int) *LoadSnapshotDefault {
 	}
 }
 
-/*LoadSnapshotDefault handles this case with default header values.
+/*
+LoadSnapshotDefault describes a response with status code -1, with default header values.
 
 Internal server error
 */
@@ -123,8 +184,41 @@ func (o *LoadSnapshotDefault) Code() int {
 	return o._statusCode
 }
 
+// IsSuccess returns true when this load snapshot default response has a 2xx status code
+func (o *LoadSnapshotDefault) IsSuccess() bool {
+	return o._statusCode/100 == 2
+}
+
+// IsRedirect returns true when this load snapshot default response has a 3xx status code
+func (o *LoadSnapshotDefault) IsRedirect() bool {
+	return o._statusCode/100 == 3
+}
+
+// IsClientError returns true when this load snapshot default response has a 4xx status code
+func (o *LoadSnapshotDefault) IsClientError() bool {
+	return o._statusCode/100 == 4
+}
+
+// IsServerError returns true when this load snapshot default response has a 5xx status code
+func (o *LoadSnapshotDefault) IsServerError() bool {
+	return o._statusCode/100 == 5
+}
+
+// IsCode returns true when this load snapshot default response a status code equal to that given
+func (o *LoadSnapshotDefault) IsCode(code int) bool {
+	return o._statusCode == code
+}
+
 func (o *LoadSnapshotDefault) Error() string {
 	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshot default  %+v", o._statusCode, o.Payload)
+}
+
+func (o *LoadSnapshotDefault) String() string {
+	return fmt.Sprintf("[PUT /snapshot/load][%d] loadSnapshot default  %+v", o._statusCode, o.Payload)
+}
+
+func (o *LoadSnapshotDefault) GetPayload() *models.Error {
+	return o.Payload
 }
 
 func (o *LoadSnapshotDefault) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {

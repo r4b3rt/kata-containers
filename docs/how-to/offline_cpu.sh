@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright (c) 2019 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -18,7 +18,6 @@ for i in $(ls -d /sys/devices/system/cpu/cpu[1-9]*); do
                         echo 0 > $i/online
                         online=`cat $i/online`
                 done
-                echo $idx > /sys/class/vhm/acrn_vhm/offline_cpu
         fi
 done
 

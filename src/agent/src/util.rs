@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use std::io;
 use std::io::ErrorKind;
@@ -18,14 +18,14 @@ const BUF_SIZE: usize = 8192;
 
 // Interruptable I/O copy using readers and writers
 // (an interruptable version of "io::copy()").
-pub async fn interruptable_io_copier<R: Sized, W: Sized>(
+pub async fn interruptable_io_copier<R, W>(
     mut reader: R,
     mut writer: W,
     mut shutdown: Receiver<bool>,
 ) -> io::Result<u64>
 where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Sized,
+    W: tokio::io::AsyncWrite + Unpin + Sized,
 {
     let mut total_bytes: u64 = 0;
 
@@ -64,13 +64,36 @@ pub fn get_vsock_incoming(fd: RawFd) -> Incoming {
 
 #[instrument]
 pub async fn get_vsock_stream(fd: RawFd) -> Result<VsockStream> {
-    let stream = get_vsock_incoming(fd).next().await.unwrap()?;
-    Ok(stream)
+    let stream = get_vsock_incoming(fd)
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("cannot handle incoming vsock connection"))?;
+
+    Ok(stream?)
+}
+
+pub fn merge<T>(v1: &mut Option<Vec<T>>, v2: &Option<Vec<T>>) -> Option<Vec<T>>
+where
+    T: Clone,
+{
+    let mut result = v1.clone().map(|mut vec| {
+        if let Some(ref other) = v2 {
+            vec.extend(other.iter().cloned());
+        }
+        vec
+    });
+
+    if result.is_none() {
+        result.clone_from(v2);
+    }
+
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::io;
     use std::io::Cursor;
     use std::io::Write;
@@ -86,7 +109,6 @@ mod tests {
     #[derive(Debug, Default, Clone)]
     struct BufWriter {
         data: Arc<Mutex<Vec<u8>>>,
-        slow_write: bool,
         write_delay: Duration,
     }
 
@@ -94,7 +116,6 @@ mod tests {
         fn new() -> Self {
             BufWriter {
                 data: Arc::new(Mutex::new(Vec::<u8>::new())),
-                slow_write: false,
                 write_delay: Duration::new(0, 0),
             }
         }
@@ -124,7 +145,9 @@ mod tests {
 
             let mut vec_locked = vec_ref.lock();
 
-            let v = vec_locked.as_deref_mut().unwrap();
+            let v = vec_locked
+                .as_deref_mut()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             std::io::Write::flush(v)
         }
@@ -158,110 +181,65 @@ mod tests {
         }
     }
 
-    impl ToString for BufWriter {
-        fn to_string(&self) -> String {
+    impl std::fmt::Display for BufWriter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let data_ref = self.data.clone();
             let output = data_ref.lock().unwrap();
             let s = (*output).clone();
 
-            String::from_utf8(s).unwrap()
+            write!(f, "{}", String::from_utf8(s).unwrap())
         }
     }
 
+    #[rstest]
+    #[case("".into())]
+    #[case("a".into())]
+    #[case("foo".into())]
+    #[case("b".repeat(BUF_SIZE - 1))]
+    #[case("c".repeat(BUF_SIZE))]
+    #[case("d".repeat(BUF_SIZE + 1))]
+    #[case("e".repeat((2 * BUF_SIZE) - 1))]
+    #[case("f".repeat(2 * BUF_SIZE))]
+    #[case("g".repeat((2 * BUF_SIZE) + 1))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_interruptable_io_copier_reader() {
-        #[derive(Debug)]
-        struct TestData {
-            reader_value: String,
-            result: io::Result<u64>,
+    async fn test_interruptable_io_copier_reader(#[case] reader_value: String) {
+        let (tx, rx) = channel(true);
+        let reader = Cursor::new(reader_value.clone());
+        let writer = BufWriter::new();
+
+        // XXX: Pass a copy of the writer to the copier to allow the
+        // result of the write operation to be checked below.
+        let handle = tokio::spawn(interruptable_io_copier(reader, writer.clone(), rx));
+
+        // Allow time for the thread to be spawned.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let timeout = tokio::time::sleep(Duration::from_secs(1));
+        pin!(timeout);
+
+        // Since the readers only specify a small number of bytes, the
+        // copier will quickly read zero and kill the task, closing the
+        // Receiver.
+        assert!(tx.is_closed());
+
+        let spawn_result: std::result::Result<std::result::Result<u64, std::io::Error>, JoinError>;
+
+        select! {
+            res = handle => spawn_result = res,
+            _ = &mut timeout => panic!("timed out"),
         }
 
-        let tests = &[
-            TestData {
-                reader_value: "".into(),
-                result: Ok(0),
-            },
-            TestData {
-                reader_value: "a".into(),
-                result: Ok(1),
-            },
-            TestData {
-                reader_value: "foo".into(),
-                result: Ok(3),
-            },
-            TestData {
-                reader_value: "b".repeat(BUF_SIZE - 1),
-                result: Ok((BUF_SIZE - 1) as u64),
-            },
-            TestData {
-                reader_value: "c".repeat(BUF_SIZE),
-                result: Ok((BUF_SIZE) as u64),
-            },
-            TestData {
-                reader_value: "d".repeat(BUF_SIZE + 1),
-                result: Ok((BUF_SIZE + 1) as u64),
-            },
-            TestData {
-                reader_value: "e".repeat((2 * BUF_SIZE) - 1),
-                result: Ok(((2 * BUF_SIZE) - 1) as u64),
-            },
-            TestData {
-                reader_value: "f".repeat(2 * BUF_SIZE),
-                result: Ok((2 * BUF_SIZE) as u64),
-            },
-            TestData {
-                reader_value: "g".repeat((2 * BUF_SIZE) + 1),
-                result: Ok(((2 * BUF_SIZE) + 1) as u64),
-            },
-        ];
+        assert!(spawn_result.is_ok());
 
-        for (i, d) in tests.iter().enumerate() {
-            // Create a string containing details of the test
-            let msg = format!("test[{}]: {:?}", i, d);
+        let result: std::result::Result<u64, std::io::Error> = spawn_result.unwrap();
 
-            let (tx, rx) = channel(true);
-            let reader = Cursor::new(d.reader_value.clone());
-            let writer = BufWriter::new();
+        assert!(result.is_ok());
 
-            // XXX: Pass a copy of the writer to the copier to allow the
-            // result of the write operation to be checked below.
-            let handle = tokio::spawn(interruptable_io_copier(reader, writer.clone(), rx));
+        let byte_count = result.unwrap() as usize;
+        assert_eq!(byte_count, reader_value.len());
 
-            // Allow time for the thread to be spawned.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            let timeout = tokio::time::sleep(Duration::from_secs(1));
-            pin!(timeout);
-
-            // Since the readers only specify a small number of bytes, the
-            // copier will quickly read zero and kill the task, closing the
-            // Receiver.
-            assert!(tx.is_closed(), "{}", msg);
-
-            let spawn_result: std::result::Result<
-                std::result::Result<u64, std::io::Error>,
-                JoinError,
-            >;
-
-            let result: std::result::Result<u64, std::io::Error>;
-
-            select! {
-                res = handle => spawn_result = res,
-                _ = &mut timeout => panic!("timed out"),
-            }
-
-            assert!(spawn_result.is_ok());
-
-            result = spawn_result.unwrap();
-
-            assert!(result.is_ok());
-
-            let byte_count = result.unwrap() as usize;
-            assert_eq!(byte_count, d.reader_value.len(), "{}", msg);
-
-            let value = writer.to_string();
-            assert_eq!(value, d.reader_value, "{}", msg);
-        }
+        let value = writer.to_string();
+        assert_eq!(value, reader_value);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -284,8 +262,6 @@ mod tests {
 
         let spawn_result: std::result::Result<std::result::Result<u64, std::io::Error>, JoinError>;
 
-        let result: std::result::Result<u64, std::io::Error>;
-
         select! {
             res = handle => spawn_result = res,
             _ = &mut timeout => panic!("timed out"),
@@ -293,7 +269,7 @@ mod tests {
 
         assert!(spawn_result.is_ok());
 
-        result = spawn_result.unwrap();
+        let result: std::result::Result<u64, std::io::Error> = spawn_result.unwrap();
 
         assert!(result.is_ok());
 
@@ -326,8 +302,6 @@ mod tests {
 
         let spawn_result: std::result::Result<std::result::Result<u64, std::io::Error>, JoinError>;
 
-        let result: std::result::Result<u64, std::io::Error>;
-
         select! {
             res = handle => spawn_result = res,
             _ = &mut timeout => panic!("timed out"),
@@ -335,7 +309,7 @@ mod tests {
 
         assert!(spawn_result.is_ok());
 
-        result = spawn_result.unwrap();
+        let result: std::result::Result<u64, std::io::Error> = spawn_result.unwrap();
 
         assert!(result.is_ok());
 

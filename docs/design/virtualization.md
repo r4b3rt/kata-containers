@@ -39,9 +39,9 @@ Details of each solution and a summary are provided below.
 Kata Containers with QEMU has complete compatibility with Kubernetes.
 
 Depending on the host architecture, Kata Containers supports various machine types,
-for example `pc` and `q35` on x86 systems, `virt` on ARM systems and `pseries` on IBM Power systems. The default Kata Containers
-machine type is `pc`. The machine type and its [`Machine accelerators`](#machine-accelerators) can
-be changed by editing the runtime [`configuration`](./architecture.md/#configuration) file.
+for example `q35` on x86 systems, `virt` on ARM systems and `pseries` on IBM Power systems. The default Kata Containers
+machine type is `q35`. The machine type and its [`Machine accelerators`](#machine-accelerators) can
+be changed by editing the runtime [`configuration`](architecture/README.md#configuration) file.
 
 Devices and features used:
 - virtio VSOCK or virtio serial
@@ -60,9 +60,8 @@ Machine accelerators are architecture specific and can be used to improve the pe
 and enable specific features of the machine types. The following machine accelerators
 are used in Kata Containers:
 
-- NVDIMM: This machine accelerator is x86 specific and only supported by `pc` and
-`q35` machine types. `nvdimm` is used to provide the root filesystem as a persistent
-memory device to the Virtual Machine.
+- NVDIMM: This machine accelerator is x86 specific and only supported by `q35` machine types.
+`nvdimm` is used to provide the root filesystem as a persistent memory device to the Virtual Machine.
 
 #### Hotplug devices
 
@@ -99,8 +98,7 @@ of Kata Containers, the Cloud Hypervisor configuration supports both CPU
 and memory resize, device hotplug (disk and VFIO), file-system sharing through virtio-fs,
 block-based volumes, booting from VM images backed by pmem device, and
 fine-grained seccomp filters for each VMM threads (e.g. all virtio
-device worker threads). Please check [this GitHub Project](https://github.com/orgs/kata-containers/projects/21)
-for details of ongoing integration efforts.
+device worker threads).
 
 Devices and features used:
 - virtio VSOCK or virtio serial
@@ -111,7 +109,23 @@ Devices and features used:
 - VFIO
 - hotplug
 - seccomp filters
-- [HTTP OpenAPI](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/master/vmm/src/api/openapi/cloud-hypervisor.yaml)
+- [HTTP OpenAPI](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/vmm/src/api/openapi/cloud-hypervisor.yaml)
+
+### StratoVirt/KVM
+
+[StratoVirt](https://gitee.com/openeuler/stratovirt) is an enterprise-level open source VMM oriented to cloud data centers, implements a unified architecture to support Standard-VMs, containers and serverless (Micro-VM). StratoVirt has some competitive advantages, such as lightweight and low resource overhead, fast boot, hardware acceleration, and language-level security with Rust.
+
+Currently, StratoVirt in Kata supports Micro-VM machine type, mainly focus on FaaS cases, supporting device hotplug (virtio block), file-system sharing through virtio fs and so on. Kata Containers with StratoVirt now use virtio-mmio bus as driver, and doesn't support CPU/memory resize nor VFIO, thus doesn't support updating container resources after booted.
+
+Devices and features used currently:
+- Micro-VM machine type for FaaS(mmio, no ACPI)
+- Virtual Socket(vhost VSOCK、virtio console)
+- Virtual Storage(virtio block, mmio)
+- Virtual Networking(virtio net, mmio)
+- Shared Filesystem(virtio fs)
+- Device Hotplugging(virtio block hotplug)
+- Entropy Source(virtio RNG)
+- QMP API
 
 ### Summary
 
@@ -120,3 +134,4 @@ Devices and features used:
 | Cloud Hypervisor | 1.10 | upstream Cloud Hypervisor with rich feature support, e.g. hotplug, VFIO and FS sharing|
 | Firecracker | 1.5 | upstream Firecracker, rust-VMM based, no VFIO, no FS sharing, no memory/CPU hotplug |
 | QEMU | 1.0 | upstream QEMU, with support for hotplug and filesystem sharing |
+| StratoVirt | 3.3 | upstream StratoVirt with FS sharing and virtio block hotplug, no VFIO, no CPU/memory resize |

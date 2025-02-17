@@ -6,7 +6,7 @@
 cluster locally. It creates a single node Kubernetes stack in a local VM.
 
 [Kata Containers](https://github.com/kata-containers) can be installed into a Minikube cluster using
-[`kata-deploy`](https://github.com/kata-containers/kata-containers/tree/main/tools/packaging/kata-deploy).
+[`kata-deploy`](../../tools/packaging/kata-deploy).
 
 This document details the pre-requisites, installation steps, and how to check
 the installation has been successful.
@@ -55,11 +55,11 @@ Here are the features to set up a CRI-O based Minikube, and why you need them:
 
 | what | why |
 | ---- | --- |
-| `--bootstrapper=kubeadm` | As recommended for [minikube CRI-o](https://kubernetes.io/docs/setup/minikube/#cri-o) |
+| `--bootstrapper=kubeadm` | As recommended for [minikube CRI-O](https://minikube.sigs.k8s.io/docs/handbook/config/#runtime-configuration) |
 | `--container-runtime=cri-o` | Using CRI-O for Kata |
-| `--enable-default-cni` | As recommended for [minikube CRI-o](https://kubernetes.io/docs/setup/minikube/#cri-o) |
+| `--enable-default-cni` | As recommended for [minikube CRI-O](https://minikube.sigs.k8s.io/docs/handbook/config/#runtime-configuration) |
 | `--memory 6144` | Allocate sufficient memory, as Kata Containers default to 1 or 2Gb |
-| `--network-plugin=cni` | As recommended for [minikube CRI-o](https://kubernetes.io/docs/setup/minikube/#cri-o) |
+| `--network-plugin=cni` | As recommended for [minikube CRI-O](https://minikube.sigs.k8s.io/docs/handbook/config/#runtime-configuration) |
 | `--vm-driver kvm2` | The host VM driver |
 
 To use containerd, modify the `--container-runtime` argument:
@@ -71,12 +71,6 @@ To use containerd, modify the `--container-runtime` argument:
 > **Notes:**
 > - Adjust the `--memory 6144` line to suit your environment and requirements. Kata Containers default to
 > requesting 2048MB per container. We recommended you supply more than that to the Minikube node.
-> - Prior to Minikube/Kubernetes v1.14, the beta `RuntimeClass` feature also needed enabling with
-> the following.
->
-> | what | why |
-> | ---- | --- |
-> | `--feature-gates=RuntimeClass=true` | Kata needs to use the `RuntimeClass` Kubernetes feature |
 
 The full command is therefore:
 
@@ -97,14 +91,14 @@ Before you install Kata Containers, check that your Minikube is operating. On yo
 $ kubectl get nodes
 ```
 
-You should see your `master` node listed as being `Ready`.
+You should see your `control-plane` node listed as being `Ready`.
 
 Check you have virtualization enabled inside your Minikube. The following should return
 a number larger than `0` if you have either of the `vmx` or `svm` nested virtualization features
 available:
 
 ```sh
-$ minikube ssh "egrep -c 'vmx|svm' /proc/cpuinfo"
+$ minikube ssh "grep -c -E 'vmx|svm' /proc/cpuinfo"
 ```
 
 ## Installing Kata Containers
@@ -123,13 +117,13 @@ $ kubectl apply -f kata-deploy/base/kata-deploy.yaml
 This installs the Kata Containers components into `/opt/kata` inside the Minikube node. It can take
 a few minutes for the operation to complete. You can check the installation has worked by checking
 the status of the `kata-deploy` pod, which will be executing
-[this script](https://github.com/kata-containers/kata-containers/tree/main/tools/packaging/kata-deploy/scripts/kata-deploy.sh),
+[this script](../../tools/packaging/kata-deploy/scripts/kata-deploy.sh),
 and will be executing a `sleep infinity` once it has successfully completed its work.
 You can accomplish this by running the following:
 
 ```sh
-$ podname=$(kubectl -n kube-system get pods -o=name | fgrep kata-deploy | sed 's?pod/??')
-$ kubectl -n kube-system exec ${podname} -- ps -ef | fgrep infinity
+$ podname=$(kubectl -n kube-system get pods -o=name | grep -F kata-deploy | sed 's?pod/??')
+$ kubectl -n kube-system exec ${podname} -- ps -ef | grep -F infinity
 ```
 
 > *NOTE:* This check only works for single node clusters, which is the default for Minikube.
@@ -138,16 +132,8 @@ $ kubectl -n kube-system exec ${podname} -- ps -ef | fgrep infinity
 
 ## Enabling Kata Containers
 
-> **Note:** Only Minikube/Kubernetes versions <= 1.13 require this step. Since version
-> v1.14, the `RuntimeClass` is enabled by default. Performing this step on Kubernetes > v1.14 is
-> however benign.
-
 Now you have installed the Kata Containers components in the Minikube node. Next, you need to configure
 Kubernetes `RuntimeClass` to know when to use Kata Containers to run a pod.
-
-```sh
-$ kubectl apply -f https://raw.githubusercontent.com/kubernetes/node-api/master/manifests/runtimeclass_crd.yaml > runtimeclass_crd.yaml
-```
 
 ### Register the runtime
 
@@ -211,7 +197,7 @@ $ minikube ssh -- uname -a
 And then compare that against the kernel that is running inside the container:
 
 ```sh
-$ podname=$(kubectl get pods -o=name | fgrep php-apache-kata-qemu | sed 's?pod/??')
+$ podname=$(kubectl get pods -o=name | grep -F php-apache-kata-qemu | sed 's?pod/??')
 $ kubectl exec ${podname} -- uname -a
 ```
 

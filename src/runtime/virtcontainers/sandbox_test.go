@@ -8,9 +8,7 @@ package virtcontainers
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -18,10 +16,10 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/manager"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/drivers"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/manager"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 
@@ -30,7 +28,6 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/sys/unix"
 )
 
 // dirMode is the permission bits used for creating a directory
@@ -43,6 +40,7 @@ func newHypervisorConfig(kernelParams []Param, hParams []Param) HypervisorConfig
 		HypervisorPath:   filepath.Join(testDir, testHypervisor),
 		KernelParams:     kernelParams,
 		HypervisorParams: hParams,
+		MemorySize:       1,
 	}
 
 }
@@ -52,6 +50,10 @@ func testCreateSandbox(t *testing.T, id string,
 	nconfig NetworkConfig, containers []ContainerConfig,
 	volumes []types.Volume) (*Sandbox, error) {
 
+	if tc.NotValid(ktu.NeedRoot()) {
+		t.Skip(testDisabledAsNonRoot)
+	}
+
 	sconfig := SandboxConfig{
 		ID:               id,
 		HypervisorType:   htype,
@@ -60,6 +62,7 @@ func testCreateSandbox(t *testing.T, id string,
 		Volumes:          volumes,
 		Containers:       containers,
 		Annotations:      sandboxAnnotations,
+		VfioMode:         config.VFIOModeGuestKernel,
 	}
 
 	ctx := WithNewAgentFunc(context.Background(), newMockAgent)
@@ -124,7 +127,7 @@ func TestCalculateSandboxCPUs(t *testing.T) {
 	tests := []struct {
 		name       string
 		containers []ContainerConfig
-		want       uint32
+		want       float32
 	}{
 		{"1-unconstrained", []ContainerConfig{unconstrained}, 0},
 		{"2-unconstrained", []ContainerConfig{unconstrained, unconstrained}, 0},
@@ -150,13 +153,14 @@ func TestCalculateSandboxMem(t *testing.T) {
 	sandbox.config = &SandboxConfig{}
 	unconstrained := newTestContainerConfigNoop("cont-00001")
 	constrained := newTestContainerConfigNoop("cont-00001")
-	limit := int64(4000)
-	constrained.Resources.Memory = &specs.LinuxMemory{Limit: &limit}
+	mlimit := int64(4000)
+	limit := uint64(4000)
+	constrained.Resources.Memory = &specs.LinuxMemory{Limit: &mlimit}
 
 	tests := []struct {
 		name       string
 		containers []ContainerConfig
-		want       int64
+		want       uint64
 	}{
 		{"1-unconstrained", []ContainerConfig{unconstrained}, 0},
 		{"2-unconstrained", []ContainerConfig{unconstrained, unconstrained}, 0},
@@ -174,6 +178,79 @@ func TestCalculateSandboxMem(t *testing.T) {
 			assert.Equal(t, swap, int64(0))
 		})
 	}
+}
+
+func TestPrepareEphemeralMounts(t *testing.T) {
+	sandbox := &Sandbox{}
+	sandbox.containers = map[string]*Container{
+		"container1": {
+			mounts: []Mount{
+				{
+					// happy path
+					Type: KataEphemeralDevType,
+					Options: []string{
+						"rw",
+						"relatime",
+					},
+					Source: "/tmp",
+				},
+				{
+					// should be ignored because it is not KataEphemeralDevType
+					Type: KataLocalDevType,
+					Options: []string{
+						"rw",
+						"relatime",
+					},
+					Source: "/tmp",
+				},
+				{
+					// should be ignored because it is sizeLimited
+					Type: KataLocalDevType,
+					Options: []string{
+						"rw",
+						"relatime",
+						"size=1M",
+					},
+					Source: "/tmp",
+				},
+			},
+		},
+	}
+
+	storages, err := sandbox.prepareEphemeralMounts(1024)
+	assert.NoError(t, err)
+	assert.Equal(t, len(storages), 1)
+	for _, s := range storages {
+		assert.Equal(t, s.Driver, KataEphemeralDevType)
+		assert.Equal(t, s.Source, "tmpfs")
+		assert.Equal(t, s.Fstype, "tmpfs")
+		assert.Equal(t, s.MountPoint, filepath.Join(ephemeralPath(), "tmp"))
+		assert.Equal(t, len(s.Options), 2) // remount, size=1024M
+
+		validSet := map[string]struct{}{
+			"remount":    {},
+			"size=1024M": {},
+		}
+		for _, opt := range s.Options {
+			if _, ok := validSet[opt]; !ok {
+				t.Error("invalid mount opt: " + opt)
+			}
+		}
+	}
+}
+
+func TestCalculateSandboxMemHandlesNegativeLimits(t *testing.T) {
+	sandbox := &Sandbox{}
+	sandbox.config = &SandboxConfig{}
+	container := newTestContainerConfigNoop("cont-00001")
+	limit := int64(-1)
+	container.Resources.Memory = &specs.LinuxMemory{Limit: &limit}
+
+	sandbox.config.Containers = []ContainerConfig{container}
+	mem, needSwap, swap := sandbox.calculateSandboxMemory()
+	assert.Equal(t, mem, uint64(0))
+	assert.Equal(t, needSwap, false)
+	assert.Equal(t, swap, int64(0))
 }
 
 func TestCreateSandboxEmptyID(t *testing.T) {
@@ -199,7 +276,7 @@ func testForceSandboxStateChangeAndCheck(t *testing.T, p *Sandbox, newSandboxSta
 	// force sandbox state change
 	err := p.setSandboxState(newSandboxState.State)
 	assert.NoError(t, err)
-	// check the in-memory state is correct
+	// Check the in-memory state is correct
 	if p.state.State != newSandboxState.State {
 		return fmt.Errorf("Expected state %v, got %v", newSandboxState.State, p.state.State)
 	}
@@ -212,7 +289,7 @@ func testForceContainerStateChangeAndCheck(t *testing.T, p *Sandbox, c *Containe
 	err := c.setContainerState(newContainerState.State)
 	assert.NoError(t, err)
 
-	// check the in-memory state is correct
+	// Check the in-memory state is correct
 	if c.state.State != newContainerState.State {
 		return fmt.Errorf("Expected state %v, got %v", newContainerState.State, c.state.State)
 	}
@@ -221,7 +298,7 @@ func testForceContainerStateChangeAndCheck(t *testing.T, p *Sandbox, c *Containe
 }
 
 func testCheckSandboxOnDiskState(p *Sandbox, sandboxState types.SandboxState) error {
-	// check on-disk state is correct
+	// Check on-disk state is correct
 	if p.state.State != sandboxState.State {
 		return fmt.Errorf("Expected state %v, got %v", sandboxState.State, p.state.State)
 	}
@@ -230,7 +307,7 @@ func testCheckSandboxOnDiskState(p *Sandbox, sandboxState types.SandboxState) er
 }
 
 func testCheckContainerOnDiskState(c *Container, containerState types.ContainerState) error {
-	// check on-disk state is correct
+	// Check on-disk state is correct
 	if c.state.State != containerState.State {
 		return fmt.Errorf("Expected state %v, got %v", containerState.State, c.state.State)
 	}
@@ -240,30 +317,27 @@ func testCheckContainerOnDiskState(c *Container, containerState types.ContainerS
 
 // writeContainerConfig write config.json to bundle path
 // and return bundle path.
-// NOTE: don't forget to delete the bundle path
-func writeContainerConfig() (string, error) {
+// NOTE: the bundle path is automatically removed by t.Cleanup
+func writeContainerConfig(t *testing.T) (string, error) {
 
 	basicSpec := `
 {
 	"ociVersion": "1.0.0-rc2-dev",
 	"process": {
-		"capabilities": [
+		"Capabilities": [
 		]
 	}
 }`
 
-	configDir, err := ioutil.TempDir("", "vc-tmp-")
-	if err != nil {
-		return "", err
-	}
+	configDir := t.TempDir()
 
-	err = os.MkdirAll(configDir, DirMode)
+	err := os.MkdirAll(configDir, DirMode)
 	if err != nil {
 		return "", err
 	}
 
 	configFilePath := filepath.Join(configDir, "config.json")
-	err = ioutil.WriteFile(configFilePath, []byte(basicSpec), 0644)
+	err = os.WriteFile(configFilePath, []byte(basicSpec), 0644)
 	if err != nil {
 		return "", err
 	}
@@ -276,10 +350,7 @@ func TestSandboxSetSandboxAndContainerState(t *testing.T) {
 	contConfig := newTestContainerConfigNoop(contID)
 	assert := assert.New(t)
 
-	configDir, err := writeContainerConfig()
-	if err != nil {
-		os.RemoveAll(configDir)
-	}
+	configDir, err := writeContainerConfig(t)
 	assert.NoError(err)
 
 	// set bundle path annotation, fetchSandbox need this annotation to get containers
@@ -307,7 +378,7 @@ func TestSandboxSetSandboxAndContainerState(t *testing.T) {
 	c, err := p.findContainer(contID)
 	assert.NoError(err)
 
-	// check initial sandbox and container states
+	// Check initial sandbox and container states
 	if err := testCheckInitSandboxAndContainerStates(p, initialSandboxState, c, initialContainerState); err != nil {
 		t.Error(err)
 	}
@@ -509,34 +580,34 @@ func TestContainerStateSetFstype(t *testing.T) {
 }
 
 func TestSandboxAttachDevicesVFIO(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("", "")
-	assert.Nil(t, err)
+	tmpDir := t.TempDir()
 	os.RemoveAll(tmpDir)
 
 	testFDIOGroup := "2"
 	testDeviceBDFPath := "0000:00:1c.0"
 
 	devicesDir := filepath.Join(tmpDir, testFDIOGroup, "devices")
-	err = os.MkdirAll(devicesDir, DirMode)
+	err := os.MkdirAll(devicesDir, DirMode)
 	assert.Nil(t, err)
 
 	deviceFile := filepath.Join(devicesDir, testDeviceBDFPath)
 	_, err = os.Create(deviceFile)
 	assert.Nil(t, err)
 
-	savedIOMMUPath := config.SysIOMMUPath
-	config.SysIOMMUPath = tmpDir
+	savedIOMMUPath := config.SysIOMMUGroupPath
+	config.SysIOMMUGroupPath = tmpDir
 
 	defer func() {
-		config.SysIOMMUPath = savedIOMMUPath
+		config.SysIOMMUGroupPath = savedIOMMUPath
 	}()
 
-	dm := manager.NewDeviceManager(manager.VirtioSCSI, false, "", nil)
+	dm := manager.NewDeviceManager(config.VirtioSCSI, false, "", 0, nil)
 	path := filepath.Join(vfioPath, testFDIOGroup)
 	deviceInfo := config.DeviceInfo{
 		HostPath:      path,
 		ContainerPath: path,
 		DevType:       "c",
+		Port:          config.RootPort,
 	}
 	dev, err := dm.NewDevice(deviceInfo)
 	assert.Nil(t, err, "deviceManager.NewDevice return error: %v", err)
@@ -565,106 +636,11 @@ func TestSandboxAttachDevicesVFIO(t *testing.T) {
 
 	containers[c.id].sandbox = &sandbox
 
-	err = containers[c.id].attachDevices(context.Background(), c.devices)
+	err = containers[c.id].attachDevices(context.Background())
 	assert.Nil(t, err, "Error while attaching devices %s", err)
 
 	err = containers[c.id].detachDevices(context.Background())
 	assert.Nil(t, err, "Error while detaching devices %s", err)
-}
-
-func TestSandboxAttachDevicesVhostUserBlk(t *testing.T) {
-	rootEnabled := true
-	tc := ktu.NewTestConstraint(false)
-	if tc.NotValid(ktu.NeedRoot()) {
-		rootEnabled = false
-	}
-
-	tmpDir, err := ioutil.TempDir("", "")
-	assert.Nil(t, err)
-	os.RemoveAll(tmpDir)
-	dm := manager.NewDeviceManager(manager.VirtioSCSI, true, tmpDir, nil)
-
-	vhostUserDevNodePath := filepath.Join(tmpDir, "/block/devices/")
-	vhostUserSockPath := filepath.Join(tmpDir, "/block/sockets/")
-	deviceNodePath := filepath.Join(vhostUserDevNodePath, "vhostblk0")
-	deviceSockPath := filepath.Join(vhostUserSockPath, "vhostblk0")
-
-	err = os.MkdirAll(vhostUserDevNodePath, dirMode)
-	assert.Nil(t, err)
-	err = os.MkdirAll(vhostUserSockPath, dirMode)
-	assert.Nil(t, err)
-	_, err = os.Create(deviceSockPath)
-	assert.Nil(t, err)
-
-	// mknod requires root privilege, call mock function for non-root to
-	// get VhostUserBlk device type.
-	if rootEnabled == true {
-		err = unix.Mknod(deviceNodePath, unix.S_IFBLK, int(unix.Mkdev(config.VhostUserBlkMajor, 0)))
-		assert.Nil(t, err)
-	} else {
-		savedFunc := config.GetVhostUserNodeStatFunc
-
-		_, err = os.Create(deviceNodePath)
-		assert.Nil(t, err)
-
-		config.GetVhostUserNodeStatFunc = func(devNodePath string,
-			devNodeStat *unix.Stat_t) error {
-			if deviceNodePath != devNodePath {
-				return fmt.Errorf("mock GetVhostUserNodeStatFunc error")
-			}
-
-			devNodeStat.Rdev = unix.Mkdev(config.VhostUserBlkMajor, 0)
-			return nil
-		}
-
-		defer func() {
-			config.GetVhostUserNodeStatFunc = savedFunc
-		}()
-	}
-
-	path := "/dev/vda"
-	deviceInfo := config.DeviceInfo{
-		HostPath:      deviceNodePath,
-		ContainerPath: path,
-		DevType:       "b",
-		Major:         config.VhostUserBlkMajor,
-		Minor:         0,
-	}
-
-	device, err := dm.NewDevice(deviceInfo)
-	assert.Nil(t, err)
-	_, ok := device.(*drivers.VhostUserBlkDevice)
-	assert.True(t, ok)
-
-	c := &Container{
-		id: "100",
-		devices: []ContainerDevice{
-			{
-				ID:            device.DeviceID(),
-				ContainerPath: path,
-			},
-		},
-	}
-
-	containers := map[string]*Container{}
-	containers[c.id] = c
-
-	sandbox := Sandbox{
-		id:         "100",
-		containers: containers,
-		hypervisor: &mockHypervisor{},
-		devManager: dm,
-		ctx:        context.Background(),
-		config:     &SandboxConfig{},
-	}
-
-	containers[c.id].sandbox = &sandbox
-
-	err = containers[c.id].attachDevices(context.Background(), c.devices)
-	assert.Nil(t, err, "Error while attaching vhost-user-blk devices %s", err)
-
-	err = containers[c.id].detachDevices(context.Background())
-	assert.Nil(t, err, "Error while detaching vhost-user-blk devices %s", err)
 }
 
 var assetContent = []byte("FakeAsset fake asset FAKE ASSET")
@@ -680,7 +656,7 @@ func TestSandboxCreateAssets(t *testing.T) {
 		annotations map[string]string
 	}
 
-	tmpfile, err := ioutil.TempFile("", "virtcontainers-test-")
+	tmpfile, err := os.CreateTemp("", "virtcontainers-test-")
 	assert.Nil(err)
 
 	filename := tmpfile.Name()
@@ -698,17 +674,15 @@ func TestSandboxCreateAssets(t *testing.T) {
 	originalInitrdPath := filepath.Join(testDir, testInitrd)
 	originalFirmwarePath := filepath.Join(testDir, testFirmware)
 	originalHypervisorPath := filepath.Join(testDir, testHypervisor)
-	originalHypervisorCtlPath := filepath.Join(testDir, testHypervisorCtl)
 	originalJailerPath := filepath.Join(testDir, testJailer)
 
 	hc := HypervisorConfig{
-		KernelPath:        originalKernelPath,
-		ImagePath:         originalImagePath,
-		InitrdPath:        originalInitrdPath,
-		FirmwarePath:      originalFirmwarePath,
-		HypervisorPath:    originalHypervisorPath,
-		HypervisorCtlPath: originalHypervisorCtlPath,
-		JailerPath:        originalJailerPath,
+		KernelPath:     originalKernelPath,
+		ImagePath:      originalImagePath,
+		InitrdPath:     originalInitrdPath,
+		FirmwarePath:   originalFirmwarePath,
+		HypervisorPath: originalHypervisorPath,
+		JailerPath:     originalJailerPath,
 	}
 
 	data := []testData{
@@ -724,13 +698,6 @@ func TestSandboxCreateAssets(t *testing.T) {
 			map[string]string{
 				annotations.HypervisorPath: filename,
 				annotations.HypervisorHash: assetContentHash,
-			},
-		},
-		{
-			types.HypervisorCtlAsset,
-			map[string]string{
-				annotations.HypervisorCtlPath: filename,
-				annotations.HypervisorCtlHash: assetContentHash,
 			},
 		},
 		{
@@ -796,6 +763,24 @@ func TestSandboxCreateAssets(t *testing.T) {
 		err = createAssets(context.Background(), config)
 		assert.Error(err, msg)
 	}
+
+	// Remote Hypervisor scenario for ImagePath
+	msg := "test[image]: imagePath"
+	imagePathData := &testData{
+		assetType: types.ImageAsset,
+		annotations: map[string]string{
+			annotations.ImagePath: "rhel9-os",
+		},
+	}
+
+	config := &SandboxConfig{
+		Annotations:      imagePathData.annotations,
+		HypervisorConfig: hc,
+		HypervisorType:   RemoteHypervisor,
+	}
+
+	err = createAssets(context.Background(), config)
+	assert.NoError(err, msg)
 }
 
 func testFindContainerFailure(t *testing.T, sandbox *Sandbox, cid string) {
@@ -961,22 +946,6 @@ func TestEnterContainer(t *testing.T) {
 
 	_, _, err = s.EnterContainer(context.Background(), contID, cmd)
 	assert.Nil(t, err, "Enter container failed: %v", err)
-}
-
-func TestDeleteStoreWhenCreateContainerFail(t *testing.T) {
-	hypervisorConfig := newHypervisorConfig(nil, nil)
-	s, err := testCreateSandbox(t, testSandboxID, MockHypervisor, hypervisorConfig, NetworkConfig{}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanUp()
-
-	contID := "999"
-	contConfig := newTestContainerConfigNoop(contID)
-	contConfig.RootFs = RootFs{Target: "", Mounted: true}
-	s.state.CgroupPath = filepath.Join(testDir, "bad-cgroup")
-	_, err = s.CreateContainer(context.Background(), contConfig)
-	assert.NotNil(t, err, "Should fail to create container due to wrong cgroup")
 }
 
 func TestDeleteStoreWhenNewContainerFail(t *testing.T) {
@@ -1181,7 +1150,7 @@ func TestAttachBlockDevice(t *testing.T) {
 		DevType:       "b",
 	}
 
-	dm := manager.NewDeviceManager(config.VirtioBlock, false, "", nil)
+	dm := manager.NewDeviceManager(config.VirtioBlock, false, "", 0, nil)
 	device, err := dm.NewDevice(deviceInfo)
 	assert.Nil(t, err)
 	_, ok := device.(*drivers.BlockDevice)
@@ -1237,7 +1206,7 @@ func TestPreAddDevice(t *testing.T) {
 		HypervisorConfig: hConfig,
 	}
 
-	dm := manager.NewDeviceManager(config.VirtioBlock, false, "", nil)
+	dm := manager.NewDeviceManager(config.VirtioBlock, false, "", 0, nil)
 	// create a sandbox first
 	sandbox := &Sandbox{
 		id:         testSandboxID,
@@ -1299,44 +1268,13 @@ func TestPreAddDevice(t *testing.T) {
 func TestGetNetNs(t *testing.T) {
 	s := Sandbox{}
 
-	expected := ""
+	expected := "/foo/bar/ns/net"
+	network, err := NewNetwork(&NetworkConfig{NetworkID: expected})
+	assert.Nil(t, err)
+
+	s.network = network
 	netNs := s.GetNetNs()
 	assert.Equal(t, netNs, expected)
-
-	expected = "/foo/bar/ns/net"
-	s.networkNS = NetworkNamespace{
-		NetNsPath: expected,
-	}
-
-	netNs = s.GetNetNs()
-	assert.Equal(t, netNs, expected)
-}
-
-func TestStartNetworkMonitor(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Test disabled as requires root user")
-	}
-	trueBinPath, err := exec.LookPath("true")
-	assert.Nil(t, err)
-	assert.NotEmpty(t, trueBinPath)
-
-	s := &Sandbox{
-		id: testSandboxID,
-		config: &SandboxConfig{
-			NetworkConfig: NetworkConfig{
-				NetmonConfig: NetmonConfig{
-					Path: trueBinPath,
-				},
-			},
-		},
-		networkNS: NetworkNamespace{
-			NetNsPath: fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), unix.Gettid()),
-		},
-		ctx: context.Background(),
-	}
-
-	err = s.startNetworkMonitor(context.Background())
-	assert.Nil(t, err)
 }
 
 func TestSandboxStopStopped(t *testing.T) {
@@ -1385,11 +1323,11 @@ func TestSandboxCreationFromConfigRollbackFromCreateSandbox(t *testing.T) {
 	// Ensure hypervisor doesn't exist
 	assert.NoError(os.Remove(hConf.HypervisorPath))
 
-	_, err := createSandboxFromConfig(ctx, sConf, nil)
+	_, err := createSandboxFromConfig(ctx, sConf, nil, nil)
 	// Fail at createSandbox: QEMU path does not exist, it is expected. Then rollback is called
 	assert.Error(err)
 
-	// check dirs
+	// Check dirs
 	err = checkSandboxRemains()
 	assert.NoError(err)
 }
@@ -1398,7 +1336,6 @@ func TestSandboxUpdateResources(t *testing.T) {
 	contConfig1 := newTestContainerConfigNoop("cont-00001")
 	contConfig2 := newTestContainerConfigNoop("cont-00002")
 	hConfig := newHypervisorConfig(nil, nil)
-
 	defer cleanUp()
 	// create a sandbox
 	s, err := testCreateSandbox(t,
@@ -1408,28 +1345,37 @@ func TestSandboxUpdateResources(t *testing.T) {
 		NetworkConfig{},
 		[]ContainerConfig{contConfig1, contConfig2},
 		nil)
-
 	assert.NoError(t, err)
+
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
 
-	containerMemLimit := int64(1000)
+	// For mock hypervisor, we MemSlots to be 0 since the memory wasn't changed.
+	assert.Equal(t, s.hypervisor.HypervisorConfig().MemSlots, uint32(0))
+
+	containerMemLimit := int64(4 * 1024 * 1024 * 1024)
 	containerCPUPeriod := uint64(1000)
 	containerCPUQouta := int64(5)
-	for _, c := range s.config.Containers {
-		c.Resources.Memory = &specs.LinuxMemory{
+	for idx := range s.config.Containers {
+		s.config.Containers[idx].Resources.Memory = &specs.LinuxMemory{
 			Limit: new(int64),
 		}
-		c.Resources.CPU = &specs.LinuxCPU{
+		s.config.Containers[idx].Resources.CPU = &specs.LinuxCPU{
 			Period: new(uint64),
 			Quota:  new(int64),
 		}
-		c.Resources.Memory.Limit = &containerMemLimit
-		c.Resources.CPU.Period = &containerCPUPeriod
-		c.Resources.CPU.Quota = &containerCPUQouta
+		s.config.Containers[idx].Resources.Memory.Limit = &containerMemLimit
+		s.config.Containers[idx].Resources.CPU.Period = &containerCPUPeriod
+		s.config.Containers[idx].Resources.CPU.Quota = &containerCPUQouta
 	}
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
+
+	// Since we're starting with a memory of 1 MB, we expect it to take 3 hotplugs to add 4GiB of memory when using ACPI hotplug:
+	// +48MB
+	// +2352MB
+	// +the remaining
+	assert.Equal(t, s.hypervisor.HypervisorConfig().MemSlots, uint32(3))
 }
 
 func TestSandboxExperimentalFeature(t *testing.T) {
@@ -1451,7 +1397,7 @@ func TestSandboxExperimentalFeature(t *testing.T) {
 	assert.True(t, sconfig.valid())
 }
 
-func TestSandbox_SetupSandboxCgroup(t *testing.T) {
+func TestSandbox_Cgroups(t *testing.T) {
 	sandboxContainer := ContainerConfig{}
 	sandboxContainer.Annotations = make(map[string]string)
 	sandboxContainer.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
@@ -1486,8 +1432,8 @@ func TestSandbox_SetupSandboxCgroup(t *testing.T) {
 		{
 			"New sandbox, new config",
 			&Sandbox{config: &SandboxConfig{}},
-			true,
 			false,
+			true,
 		},
 		{
 			"sandbox, container no sandbox type",
@@ -1495,8 +1441,8 @@ func TestSandbox_SetupSandboxCgroup(t *testing.T) {
 				config: &SandboxConfig{Containers: []ContainerConfig{
 					{},
 				}}},
-			true,
 			false,
+			true,
 		},
 		{
 			"sandbox, container sandbox type",
@@ -1504,8 +1450,8 @@ func TestSandbox_SetupSandboxCgroup(t *testing.T) {
 				config: &SandboxConfig{Containers: []ContainerConfig{
 					sandboxContainer,
 				}}},
-			true,
 			false,
+			true,
 		},
 		{
 			"sandbox, empty linux json",
@@ -1532,9 +1478,16 @@ func TestSandbox_SetupSandboxCgroup(t *testing.T) {
 		}
 
 		t.Run(tt.name, func(t *testing.T) {
-			tt.s.createCgroupManager()
-			if err := tt.s.setupSandboxCgroup(); (err != nil) != tt.wantErr {
-				t.Errorf("Sandbox.SetupSandboxCgroupOnly() error = %v, wantErr %v", err, tt.wantErr)
+			err := tt.s.createResourceController()
+			t.Logf("create groups error %v", err)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Sandbox.CreateCgroups() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if err == nil {
+				if err := tt.s.setupResourceController(); (err != nil) != tt.wantErr {
+					t.Errorf("Sandbox.SetupCgroups() error = %v, wantErr %v", err, tt.wantErr)
+				}
 			}
 		})
 	}
@@ -1662,4 +1615,42 @@ func TestGetSandboxCpuSet(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSandboxHugepageLimit(t *testing.T) {
+	contConfig1 := newTestContainerConfigNoop("cont-00001")
+	contConfig2 := newTestContainerConfigNoop("cont-00002")
+	limit := int64(4000)
+	contConfig1.Resources.Memory = &specs.LinuxMemory{Limit: &limit}
+	contConfig2.Resources.Memory = &specs.LinuxMemory{Limit: &limit}
+	hConfig := newHypervisorConfig(nil, nil)
+
+	defer cleanUp()
+	// create a sandbox
+	s, err := testCreateSandbox(t,
+		testSandboxID,
+		MockHypervisor,
+		hConfig,
+		NetworkConfig{},
+		[]ContainerConfig{contConfig1, contConfig2},
+		nil)
+
+	assert.NoError(t, err)
+
+	hugepageLimits := []specs.LinuxHugepageLimit{
+		{
+			Pagesize: "1GB",
+			Limit:    322122547,
+		},
+		{
+			Pagesize: "2MB",
+			Limit:    134217728,
+		},
+	}
+
+	for i := range s.config.Containers {
+		s.config.Containers[i].Resources.HugepageLimits = hugepageLimits
+	}
+	err = s.updateResources(context.Background())
+	assert.NoError(t, err)
 }

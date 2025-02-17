@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 IBM
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -10,10 +12,10 @@ import (
 	"fmt"
 	"testing"
 
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/device/config"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 )
 
 func newTestQemu(assert *assert.Assertions, machineType string) qemuArch {
@@ -109,7 +111,7 @@ func TestQemuS390xAppendProtectionDevice(t *testing.T) {
 	var devices []govmmQemu.Device
 	var bios, firmware string
 	var err error
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware)
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
 	assert.NoError(err)
 
 	// no protection
@@ -117,26 +119,32 @@ func TestQemuS390xAppendProtectionDevice(t *testing.T) {
 
 	// PEF protection
 	s390x.(*qemuS390x).protection = pefProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware)
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// TDX protection
 	s390x.(*qemuS390x).protection = tdxProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware)
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// SEV protection
 	s390x.(*qemuS390x).protection = sevProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware)
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	assert.Error(err)
+	assert.Empty(bios)
+
+	// SNP protection
+	s390x.(*qemuS390x).protection = snpProtection
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// Secure Execution protection
 	s390x.(*qemuS390x).protection = seProtection
 
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware)
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
 	assert.NoError(err)
 	assert.Empty(bios)
 

@@ -6,7 +6,6 @@
 package virtcontainers
 
 import (
-	"io/ioutil"
 	"net"
 	"os"
 	"reflect"
@@ -35,12 +34,16 @@ func TestVhostUserEndpointTypeSet(t *testing.T) {
 	testEndpointTypeSet(t, "vhost-user", VhostUserEndpointType)
 }
 
-func TestBridgedMacvlanEndpointTypeSet(t *testing.T) {
-	testEndpointTypeSet(t, "macvlan", BridgedMacvlanEndpointType)
+func TestMacvlanEndpointTypeSet(t *testing.T) {
+	testEndpointTypeSet(t, "macvlan", MacvlanEndpointType)
 }
 
 func TestMacvtapEndpointTypeSet(t *testing.T) {
 	testEndpointTypeSet(t, "macvtap", MacvtapEndpointType)
+}
+
+func TestVfioEndpointTypeSet(t *testing.T) {
+	testEndpointTypeSet(t, "vfio", VfioEndpointType)
 }
 
 func TestEndpointTypeSetFailure(t *testing.T) {
@@ -69,9 +72,9 @@ func TestVhostUserEndpointTypeString(t *testing.T) {
 	testEndpointTypeString(t, &endpointType, string(VhostUserEndpointType))
 }
 
-func TestBridgedMacvlanEndpointTypeString(t *testing.T) {
-	endpointType := BridgedMacvlanEndpointType
-	testEndpointTypeString(t, &endpointType, string(BridgedMacvlanEndpointType))
+func TestMacvlanEndpointTypeString(t *testing.T) {
+	endpointType := MacvlanEndpointType
+	testEndpointTypeString(t, &endpointType, string(MacvlanEndpointType))
 }
 
 func TestMacvtapEndpointTypeString(t *testing.T) {
@@ -87,7 +90,7 @@ func TestIncorrectEndpointTypeString(t *testing.T) {
 func TestSaveLoadIfPair(t *testing.T) {
 	macAddr := net.HardwareAddr{0x02, 0x00, 0xCA, 0xFE, 0x00, 0x04}
 
-	tmpfile, err := ioutil.TempFile("", "vc-save-load-net-")
+	tmpfile, err := os.CreateTemp("", "vc-Save-Load-net-")
 	assert.Nil(t, err)
 	defer os.Remove(tmpfile.Name())
 
@@ -109,7 +112,7 @@ func TestSaveLoadIfPair(t *testing.T) {
 		NetInterworkingModel: DefaultNetInterworkingModel,
 	}
 
-	// Save to disk then load it back.
+	// Save to disk then Load it back.
 	savedIfPair := saveNetIfPair(netPair)
 	loadedIfPair := loadNetIfPair(savedIfPair)
 

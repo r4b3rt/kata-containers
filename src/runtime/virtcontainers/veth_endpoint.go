@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -11,7 +13,7 @@ import (
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 var vethTrace = getNetworkTrace(VethEndpointType)
@@ -103,7 +105,7 @@ func (endpoint *VethEndpoint) Attach(ctx context.Context, s *Sandbox) error {
 		return err
 	}
 
-	return h.addDevice(ctx, endpoint, netDev)
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
 // Detach for the veth endpoint tears down the tap and bridge
@@ -124,16 +126,17 @@ func (endpoint *VethEndpoint) Detach(ctx context.Context, netNsCreated bool, net
 }
 
 // HotAttach for the veth endpoint uses hot plug device
-func (endpoint *VethEndpoint) HotAttach(ctx context.Context, h hypervisor) error {
+func (endpoint *VethEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
 	span, ctx := vethTrace(ctx, "HotAttach", endpoint)
 	defer span.End()
 
+	h := s.hypervisor
 	if err := xConnectVMNetwork(ctx, endpoint, h); err != nil {
 		networkLogger().WithError(err).Error("Error bridging virtual ep")
 		return err
 	}
 
-	if _, err := h.hotplugAddDevice(ctx, endpoint, netDev); err != nil {
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error attach virtual ep")
 		return err
 	}
@@ -141,7 +144,7 @@ func (endpoint *VethEndpoint) HotAttach(ctx context.Context, h hypervisor) error
 }
 
 // HotDetach for the veth endpoint uses hot pull device
-func (endpoint *VethEndpoint) HotDetach(ctx context.Context, h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *VethEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
 	if !netNsCreated {
 		return nil
 	}
@@ -155,7 +158,8 @@ func (endpoint *VethEndpoint) HotDetach(ctx context.Context, h hypervisor, netNs
 		networkLogger().WithError(err).Warn("Error un-bridging virtual ep")
 	}
 
-	if _, err := h.hotplugRemoveDevice(ctx, endpoint, netDev); err != nil {
+	h := s.hypervisor
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error detach virtual ep")
 		return err
 	}

@@ -14,12 +14,8 @@ PROJECT_COMPONENT = kata-agent
 
 TARGET = $(PROJECT_COMPONENT)
 
-SOURCES := \
-  $(shell find . 2>&1 | grep -E '.*\.rs$$') \
-  Cargo.toml
-
 VERSION_FILE := ./VERSION
-VERSION := $(shell grep -v ^\# $(VERSION_FILE))
+VERSION := $(shell grep -v ^\# $(VERSION_FILE) 2>/dev/null || echo "unknown")
 COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
 COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
@@ -27,12 +23,56 @@ COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
 # Exported to allow cargo to see it
 export VERSION_COMMIT := $(if $(COMMIT),$(VERSION)-$(COMMIT),$(VERSION))
 
+EXTRA_RUSTFEATURES :=
+
+##VAR SECCOMP=yes|no define if agent enables seccomp feature
+SECCOMP ?= yes
+
+# Enable seccomp feature of rust build
+ifeq ($(SECCOMP),yes)
+    override EXTRA_RUSTFEATURES += seccomp
+endif
+
+##VAR AGENT_POLICY=yes|no define if agent enables the policy feature
+AGENT_POLICY ?= no
+
+# Enable the policy feature of rust build
+ifeq ($(AGENT_POLICY),yes)
+    override EXTRA_RUSTFEATURES += agent-policy
+endif
+
+##VAR PULL_TYPE=default|guest-pull define if agent enables the guest pull image feature
+PULL_TYPE ?= default
+ifeq ($(PULL_TYPE),default)
+    override EXTRA_RUSTFEATURES += default-pull
+# Enable guest pull image feature of rust build
+else ifeq ($(PULL_TYPE),guest-pull)
+    override EXTRA_RUSTFEATURES += guest-pull
+endif
+
+
 include ../../utils.mk
+
+ifeq ($(ARCH), ppc64le)
+    override ARCH = powerpc64le
+endif
+
+##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
+STANDARD_OCI_RUNTIME := no
+
+# Enable standard oci runtime feature of rust build
+ifeq ($(STANDARD_OCI_RUNTIME),yes)
+    override EXTRA_RUSTFEATURES += standard-oci-runtime
+endif
+
+ifneq ($(EXTRA_RUSTFEATURES),)
+    override EXTRA_RUSTFEATURES := --features "$(EXTRA_RUSTFEATURES)"
+endif
 
 TARGET_PATH = target/$(TRIPLE)/$(BUILD_TYPE)/$(TARGET)
 
 ##VAR DESTDIR=<path> is a directory prepended to each installed target file
-DESTDIR :=
+DESTDIR ?=
 ##VAR BINDIR=<path> is a directory for installing executable programs
 BINDIR := /usr/bin
 
@@ -84,32 +124,24 @@ define INSTALL_FILE
 	install -D -m 644 $1 $(DESTDIR)$2/$1 || exit 1;
 endef
 
+.DEFAULT_GOAL := default
+
 ##TARGET default: build code
 default: $(TARGET) show-header
 
+static-checks-build: $(GENERATED_CODE)
+
 $(TARGET): $(GENERATED_CODE) $(TARGET_PATH)
 
-$(TARGET_PATH): $(SOURCES) | show-summary
-	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE)
+$(TARGET_PATH): show-summary
+	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 $(GENERATED_FILES): %: %.in
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
-optimize: $(SOURCES) | show-summary show-header
-	@RUSTFLAGS="-C link-arg=-s $(EXTRA_RUSTFLAGS) --deny-warnings" cargo build --target $(TRIPLE) --$(BUILD_TYPE)
-
-
-##TARGET clippy: run clippy linter
-clippy: $(GENERATED_CODE)
-	cargo clippy --all-targets --all-features --release \
-		-- \
-		-Aclippy::redundant_allocation \
-		-D warnings
-
-format:
-	cargo fmt -- --check
-
+optimize: show-summary show-header
+	@RUSTFLAGS="-C link-arg=-s $(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
 ##TARGET install: install agent
 install: install-services
@@ -126,11 +158,11 @@ vendor:
 
 
 #TARGET test: run cargo tests
-test:
-	@cargo test --all --target $(TRIPLE)
+test: $(GENERATED_FILES)
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test --all --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
-check: clippy format
+check: $(GENERATED_FILES) standard_rust_check
 
 ##TARGET run: build and run agent
 run:
@@ -192,11 +224,11 @@ codecov-html: check_tarpaulin
 
 .PHONY: \
 	help \
+	optimize \
 	show-header \
 	show-summary \
-	optimize \
 	vendor
 
 ##TARGET generate-protocols: generate/update grpc agent protocols
 generate-protocols:
-	protocols/hack/update-generated-proto.sh all
+	../libs/protocols/hack/update-generated-proto.sh all

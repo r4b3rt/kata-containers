@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Huawei Corporation
 // Copyright (c) 2019 Intel Corporation
 //
@@ -15,7 +17,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 var tuntapTrace = getNetworkTrace(TuntapEndpointType)
@@ -82,7 +84,7 @@ func (endpoint *TuntapEndpoint) Attach(ctx context.Context, s *Sandbox) error {
 		return err
 	}
 
-	return h.addDevice(ctx, endpoint, netDev)
+	return h.AddDevice(ctx, endpoint, NetDev)
 }
 
 // Detach for the tun/tap endpoint tears down the tap
@@ -101,18 +103,19 @@ func (endpoint *TuntapEndpoint) Detach(ctx context.Context, netNsCreated bool, n
 }
 
 // HotAttach for the tun/tap endpoint uses hot plug device
-func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, h hypervisor) error {
+func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, s *Sandbox) error {
 	networkLogger().Info("Hot attaching tun/tap endpoint")
 
 	span, ctx := tuntapTrace(ctx, "HotAttach", endpoint)
 	defer span.End()
 
-	if err := tuntapNetwork(endpoint, h.hypervisorConfig().NumVCPUs, h.hypervisorConfig().DisableVhostNet); err != nil {
+	h := s.hypervisor
+	if err := tuntapNetwork(endpoint, h.HypervisorConfig().NumVCPUs(), h.HypervisorConfig().DisableVhostNet); err != nil {
 		networkLogger().WithError(err).Error("Error bridging tun/tap ep")
 		return err
 	}
 
-	if _, err := h.hotplugAddDevice(ctx, endpoint, netDev); err != nil {
+	if _, err := h.HotplugAddDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error attach tun/tap ep")
 		return err
 	}
@@ -120,7 +123,7 @@ func (endpoint *TuntapEndpoint) HotAttach(ctx context.Context, h hypervisor) err
 }
 
 // HotDetach for the tun/tap endpoint uses hot pull device
-func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, h hypervisor, netNsCreated bool, netNsPath string) error {
+func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error {
 	networkLogger().Info("Hot detaching tun/tap endpoint")
 
 	span, ctx := tuntapTrace(ctx, "HotDetach", endpoint)
@@ -132,7 +135,8 @@ func (endpoint *TuntapEndpoint) HotDetach(ctx context.Context, h hypervisor, net
 		networkLogger().WithError(err).Warn("Error un-bridging tun/tap ep")
 	}
 
-	if _, err := h.hotplugRemoveDevice(ctx, endpoint, netDev); err != nil {
+	h := s.hypervisor
+	if _, err := h.HotplugRemoveDevice(ctx, endpoint, NetDev); err != nil {
 		networkLogger().WithError(err).Error("Error detach tun/tap ep")
 		return err
 	}
@@ -173,7 +177,7 @@ func tuntapNetwork(endpoint *TuntapEndpoint, numCPUs uint32, disableVhostNet boo
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 
 	tapLink, _, err := createLink(netHandle, endpoint.TuntapInterface.TAPIface.Name, &netlink.Tuntap{}, int(numCPUs))
 	if err != nil {
@@ -201,7 +205,7 @@ func unTuntapNetwork(name string) error {
 	if err != nil {
 		return err
 	}
-	defer netHandle.Delete()
+	defer netHandle.Close()
 	tapLink, err := getLinkByName(netHandle, name, &netlink.Tuntap{})
 	if err != nil {
 		return fmt.Errorf("Could not get TAP interface: %s", err)

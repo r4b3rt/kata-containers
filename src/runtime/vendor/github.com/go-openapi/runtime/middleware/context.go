@@ -16,6 +16,7 @@ package middleware
 
 import (
 	stdContext "context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,11 +24,13 @@ import (
 	"github.com/go-openapi/analysis"
 	"github.com/go-openapi/errors"
 	"github.com/go-openapi/loads"
+	"github.com/go-openapi/spec"
+	"github.com/go-openapi/strfmt"
+
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/runtime/logger"
 	"github.com/go-openapi/runtime/middleware/untyped"
-	"github.com/go-openapi/spec"
-	"github.com/go-openapi/strfmt"
+	"github.com/go-openapi/runtime/security"
 )
 
 // Debug when true turns on verbose logging
@@ -192,6 +195,17 @@ func NewRoutableContext(spec *loads.Document, routableAPI RoutableAPI, routes Ro
 	if spec != nil {
 		an = analysis.New(spec.Spec())
 	}
+
+	return NewRoutableContextWithAnalyzedSpec(spec, an, routableAPI, routes)
+}
+
+// NewRoutableContextWithAnalyzedSpec is like NewRoutableContext but takes in input the analysed spec too
+func NewRoutableContextWithAnalyzedSpec(spec *loads.Document, an *analysis.Spec, routableAPI RoutableAPI, routes Router) *Context {
+	// Either there are no spec doc and analysis, or both of them.
+	if !((spec == nil && an == nil) || (spec != nil && an != nil)) {
+		panic(errors.New(http.StatusInternalServerError, "routable context requires either both spec doc and analysis, or none of them"))
+	}
+
 	ctx := &Context{spec: spec, api: routableAPI, analyzer: an, router: routes}
 	return ctx
 }
@@ -277,8 +291,8 @@ func (c *Context) RequiredProduces() []string {
 // if the request is not valid an error will be returned
 func (c *Context) BindValidRequest(request *http.Request, route *MatchedRoute, binder RequestBinder) error {
 	var res []error
+	var requestContentType string
 
-	requestContentType := "*/*"
 	// check and validate content type, select consumer
 	if runtime.HasBody(request) {
 		ct, _, err := runtime.ContentType(request.Header)
@@ -301,7 +315,13 @@ func (c *Context) BindValidRequest(request *http.Request, route *MatchedRoute, b
 	}
 
 	// check and validate the response format
-	if len(res) == 0 && runtime.HasBody(request) {
+	if len(res) == 0 {
+		// if the route does not provide Produces and a default contentType could not be identified
+		// based on a body, typical for GET and DELETE requests, then default contentType to.
+		if len(route.Produces) == 0 && requestContentType == "" {
+			requestContentType = "*/*"
+		}
+
 		if str := NegotiateContentType(request, route.Produces, requestContentType); str == "" {
 			res = append(res, errors.InvalidResponseFormat(request.Header.Get(runtime.HeaderAccept), route.Produces))
 		}
@@ -426,9 +446,15 @@ func (c *Context) Authorize(request *http.Request, route *MatchedRoute) (interfa
 	}
 	if route.Authorizer != nil {
 		if err := route.Authorizer.Authorize(request, usr); err != nil {
+			if _, ok := err.(errors.Error); ok {
+				return nil, nil, err
+			}
+
 			return nil, nil, errors.New(http.StatusForbidden, err.Error())
 		}
 	}
+
+	rCtx = request.Context()
 
 	rCtx = stdContext.WithValue(rCtx, ctxSecurityPrincipal, usr)
 	rCtx = stdContext.WithValue(rCtx, ctxSecurityScopes, route.Authenticator.AllScopes())
@@ -483,7 +509,9 @@ func (c *Context) Respond(rw http.ResponseWriter, r *http.Request, produces []st
 
 	if resp, ok := data.(Responder); ok {
 		producers := route.Producers
-		prod, ok := producers[format]
+		// producers contains keys with normalized format, if a format has MIME type parameter such as `text/plain; charset=utf-8`
+		// then you must provide `text/plain` to get the correct producer. HOWEVER, format here is not normalized.
+		prod, ok := producers[normalizeOffer(format)]
 		if !ok {
 			prods := c.api.ProducersFor(normalizeOffers([]string{c.api.DefaultProduces()}))
 			pr, ok := prods[c.api.DefaultProduces()]
@@ -500,6 +528,11 @@ func (c *Context) Respond(rw http.ResponseWriter, r *http.Request, produces []st
 		if format == "" {
 			rw.Header().Set(runtime.HeaderContentType, runtime.JSONMime)
 		}
+
+		if realm := security.FailedBasicAuth(r); realm != "" {
+			rw.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", realm))
+		}
+
 		if route == nil || route.Operation == nil {
 			c.api.ServeErrorFor("")(rw, r, err)
 			return
@@ -549,6 +582,26 @@ func (c *Context) Respond(rw http.ResponseWriter, r *http.Request, produces []st
 	}
 
 	c.api.ServeErrorFor(route.Operation.ID)(rw, r, errors.New(http.StatusInternalServerError, "can't produce response"))
+}
+
+func (c *Context) APIHandlerSwaggerUI(builder Builder) http.Handler {
+	b := builder
+	if b == nil {
+		b = PassthroughBuilder
+	}
+
+	var title string
+	sp := c.spec.Spec()
+	if sp != nil && sp.Info != nil && sp.Info.Title != "" {
+		title = sp.Info.Title
+	}
+
+	swaggerUIOpts := SwaggerUIOpts{
+		BasePath: c.BasePath(),
+		Title:    title,
+	}
+
+	return Spec("", c.spec.Raw(), SwaggerUI(swaggerUIOpts, c.RoutesHandler(b)))
 }
 
 // APIHandler returns a handler to serve the API, this includes a swagger spec, router and the contract defined in the swagger spec

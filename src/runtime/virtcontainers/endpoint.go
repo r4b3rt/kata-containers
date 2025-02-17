@@ -10,7 +10,7 @@ import (
 	"fmt"
 
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
+	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
 // Endpoint represents a physical or virtual network interface.
@@ -26,8 +26,8 @@ type Endpoint interface {
 	SetPciPath(vcTypes.PciPath)
 	Attach(context.Context, *Sandbox) error
 	Detach(ctx context.Context, netNsCreated bool, netNsPath string) error
-	HotAttach(ctx context.Context, h hypervisor) error
-	HotDetach(ctx context.Context, h hypervisor, netNsCreated bool, netNsPath string) error
+	HotAttach(context.Context, *Sandbox) error
+	HotDetach(ctx context.Context, s *Sandbox, netNsCreated bool, netNsPath string) error
 
 	save() persistapi.NetworkEndpoint
 	load(persistapi.NetworkEndpoint)
@@ -51,8 +51,8 @@ const (
 	// VhostUserEndpointType is the vhostuser network interface.
 	VhostUserEndpointType EndpointType = "vhost-user"
 
-	// BridgedMacvlanEndpointType is macvlan network interface.
-	BridgedMacvlanEndpointType EndpointType = "macvlan"
+	// MacvlanEndpointType is macvlan network interface.
+	MacvlanEndpointType EndpointType = "macvlan"
 
 	// MacvtapEndpointType is macvtap network interface.
 	MacvtapEndpointType EndpointType = "macvtap"
@@ -65,6 +65,13 @@ const (
 
 	// IPVlanEndpointType is ipvlan network interface.
 	IPVlanEndpointType EndpointType = "ipvlan"
+
+	// VfioEndpointType is a VFIO device that will be claimed as a network interface
+	// in the guest VM. Unlike PhysicalEndpointType, which requires a VF network interface
+	// with its network configured on the host before creating the sandbox, VfioEndpointType
+	// does not need a host network interface and instead has its network network configured
+	// through DAN.
+	VfioEndpointType EndpointType = "vfio"
 )
 
 // Set sets an endpoint type based on the input string.
@@ -80,7 +87,7 @@ func (endpointType *EndpointType) Set(value string) error {
 		*endpointType = VhostUserEndpointType
 		return nil
 	case "macvlan":
-		*endpointType = BridgedMacvlanEndpointType
+		*endpointType = MacvlanEndpointType
 		return nil
 	case "macvtap":
 		*endpointType = MacvtapEndpointType
@@ -93,6 +100,9 @@ func (endpointType *EndpointType) Set(value string) error {
 		return nil
 	case "ipvlan":
 		*endpointType = IPVlanEndpointType
+		return nil
+	case "vfio":
+		*endpointType = VfioEndpointType
 		return nil
 	default:
 		return fmt.Errorf("Unknown endpoint type %s", value)
@@ -108,8 +118,8 @@ func (endpointType *EndpointType) String() string {
 		return string(VethEndpointType)
 	case VhostUserEndpointType:
 		return string(VhostUserEndpointType)
-	case BridgedMacvlanEndpointType:
-		return string(BridgedMacvlanEndpointType)
+	case MacvlanEndpointType:
+		return string(MacvlanEndpointType)
 	case MacvtapEndpointType:
 		return string(MacvtapEndpointType)
 	case TapEndpointType:
@@ -118,6 +128,8 @@ func (endpointType *EndpointType) String() string {
 		return string(TuntapEndpointType)
 	case IPVlanEndpointType:
 		return string(IPVlanEndpointType)
+	case VfioEndpointType:
+		return string(VfioEndpointType)
 	default:
 		return ""
 	}
@@ -227,4 +239,14 @@ func loadTuntapIf(tuntapif *persistapi.TuntapInterface) *TuntapInterface {
 			Addrs:    tuntapif.TAPIface.Addrs,
 		},
 	}
+}
+
+func findEndpoint(e Endpoint, endpoints []Endpoint) (Endpoint, int) {
+	for idx, ep := range endpoints {
+		if ep.HardwareAddr() == e.HardwareAddr() {
+			return ep, idx
+		}
+	}
+
+	return nil, 0
 }

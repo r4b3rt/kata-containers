@@ -1,45 +1,40 @@
-# Copyright Intel Corporation.
+# Copyright Intel Corporation, 2022 IBM Corp.
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM registry.centos.org/centos:7 AS base
-
-ENV container docker
-
-RUN (cd /lib/systemd/system/sysinit.target.wants/; for i in *; do [ $i == systemd-tmpfiles-setup.service ] || rm -f $i; done); \
-rm -f /lib/systemd/system/multi-user.target.wants/*; \
-rm -f /etc/systemd/system/*.wants/*; \
-rm -f /lib/systemd/system/local-fs.target.wants/*; \
-rm -f /lib/systemd/system/sockets.target.wants/*udev*; \
-rm -f /lib/systemd/system/sockets.target.wants/*initctl*; \
-rm -f /lib/systemd/system/basic.target.wants/*; \
-rm -f /lib/systemd/system/anaconda.target.wants/*;
-
-VOLUME [ "/sys/fs/cgroup" ]
-
-CMD ["/usr/sbin/init"]
-
-FROM base
-
-ARG KUBE_ARCH=amd64
+ARG BASE_IMAGE_NAME=alpine
+ARG BASE_IMAGE_TAG=3.18
+FROM $BASE_IMAGE_NAME:$BASE_IMAGE_TAG
 ARG KATA_ARTIFACTS=./kata-static.tar.xz
 ARG DESTINATION=/opt/kata-artifacts
 
-COPY ${KATA_ARTIFACTS} .
+COPY ${KATA_ARTIFACTS} ${WORKDIR}
 
+# I understand that in order to be on the safer side, it'd
+# be good to have the alpine packages pointing to a very
+# specific version, but this may break anyone else trying
+# to use a different version of alpine for one reason or
+# another.  With this in mind, let's ignore DL3018.
+# SC2086 is about using double quotes to prevent globbing and
+# word splitting, which can also be ignored for now.
+# hadolint ignore=DL3018,SC2086
 RUN \
-yum -y update && \
-yum install -y epel-release && \
-yum install -y bzip2 jq && \
-yum clean all && \
-mkdir -p ${DESTINATION} && \
-tar xvf ${KATA_ARTIFACTS} -C ${DESTINATION}/ && \
-chown -R root:root ${DESTINATION}/
-
-RUN \
-curl -Lso /bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/${KUBE_ARCH}/kubectl && \
-chmod +x /bin/kubectl
+	apk --no-cache add bash curl && \
+	ARCH=$(uname -m) && \
+	if [ "${ARCH}" = "x86_64" ]; then ARCH=amd64; fi && \
+	if [ "${ARCH}" = "aarch64" ]; then ARCH=arm64; fi && \
+	DEBIAN_ARCH=${ARCH} && \
+	if [ "${DEBIAN_ARCH}" = "ppc64le" ]; then DEBIAN_ARCH=ppc64el; fi && \
+	curl -fL --progress-bar -o /usr/bin/kubectl https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl && \
+	chmod +x /usr/bin/kubectl && \
+	curl -fL --progress-bar -o /usr/bin/jq https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${DEBIAN_ARCH} && \
+	chmod +x /usr/bin/jq && \
+	mkdir -p ${DESTINATION} && \
+	tar xvf ${WORKDIR}/${KATA_ARTIFACTS} -C ${DESTINATION} && \
+	rm -f ${WORKDIR}/${KATA_ARTIFACTS} && \
+	apk del curl && \
+	apk --no-cache add py3-pip && \
+	pip install --no-cache-dir yq==3.2.3
 
 COPY scripts ${DESTINATION}/scripts
-RUN \
-ln -s ${DESTINATION}/scripts/kata-deploy.sh /usr/bin/kata-deploy
+COPY runtimeclasses ${DESTINATION}/runtimeclasses

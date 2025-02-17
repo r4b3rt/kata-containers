@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright (c) 2018 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -14,16 +16,23 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/intel-go/cpuid"
-	govmmQemu "github.com/kata-containers/govmm/qemu"
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
+	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
 )
 
 type qemuAmd64 struct {
 	// inherit from qemuArchBase, overwrite methods if needed
 	qemuArchBase
 
+	snpGuest bool
+
 	vmFactory bool
 
 	devLoadersCount uint32
+
+	sgxEPCSize int64
+
+	qgsPort uint32
 }
 
 const (
@@ -31,22 +40,12 @@ const (
 
 	defaultQemuMachineType = QemuQ35
 
-	defaultQemuMachineOptions = "accel=kvm,kernel_irqchip=on"
+	defaultQemuMachineOptions = "accel=kvm"
+
+	splitIrqChipMachineOptions = "accel=kvm,kernel_irqchip=split"
 
 	qmpMigrationWaitTimeout = 5 * time.Second
-
-	tdxSysFirmwareDir = "/sys/firmware/tdx_seam/"
-
-	tdxCPUFlag = "tdx"
-
-	sevKvmParameterPath = "/sys/module/kvm_amd/parameters/sev"
 )
-
-var qemuPaths = map[string]string{
-	QemuPCLite:  "/usr/bin/qemu-lite-system-x86_64",
-	QemuQ35:     defaultQemuPath,
-	QemuMicrovm: defaultQemuPath,
-}
 
 var kernelParams = []Param{
 	{"tsc", "reliable"},
@@ -58,18 +57,12 @@ var kernelParams = []Param{
 	{"i8042.noaux", "1"},
 	{"noreplace-smp", ""},
 	{"reboot", "k"},
-	{"console", "hvc0"},
-	{"console", "hvc1"},
 	{"cryptomgr.notests", ""},
 	{"net.ifnames", "0"},
 	{"pci", "lastbus=0"},
 }
 
 var supportedQemuMachines = []govmmQemu.Machine{
-	{
-		Type:    QemuPCLite,
-		Options: defaultQemuMachineOptions,
-	},
 	{
 		Type:    QemuQ35,
 		Options: defaultQemuMachineOptions,
@@ -82,11 +75,6 @@ var supportedQemuMachines = []govmmQemu.Machine{
 		Type:    QemuMicrovm,
 		Options: defaultQemuMachineOptions,
 	},
-}
-
-// MaxQemuVCPUs returns the maximum number of vCPUs supported
-func MaxQemuVCPUs() uint32 {
-	return uint32(240)
 }
 
 func newQemuArch(config HypervisorConfig) (qemuArch, error) {
@@ -114,7 +102,7 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	// IOMMU and Guest Protection require a split IRQ controller for handling interrupts
 	// otherwise QEMU won't be able to create the kernel irqchip
 	if config.IOMMU || config.ConfidentialGuest {
-		mp.Options = "accel=kvm,kernel_irqchip=split"
+		mp.Options = splitIrqChipMachineOptions
 	}
 
 	if config.IOMMU {
@@ -127,7 +115,7 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 	q := &qemuAmd64{
 		qemuArchBase: qemuArchBase{
 			qemuMachine:          *mp,
-			qemuExePath:          qemuPaths[machineType],
+			qemuExePath:          defaultQemuPath,
 			memoryOffset:         config.MemOffset,
 			kernelParamsNonDebug: kernelParamsNonDebug,
 			kernelParamsDebug:    kernelParamsDebug,
@@ -135,31 +123,55 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 			disableNvdimm:        config.DisableImageNvdimm,
 			dax:                  true,
 			protection:           noneProtection,
+			legacySerial:         config.LegacySerial,
 		},
 		vmFactory: factory,
+		snpGuest:  config.SevSnpGuest,
+		qgsPort:   config.QgsPort,
 	}
 
 	if config.ConfidentialGuest {
 		if err := q.enableProtection(); err != nil {
 			return nil, err
 		}
+
+		if !q.qemuArchBase.disableNvdimm {
+			hvLogger.WithField("subsystem", "qemuAmd64").Warn("Nvdimm is not supported with confidential guest, disabling it.")
+			q.qemuArchBase.disableNvdimm = true
+		}
 	}
 
-	q.handleImagePath(config)
+	if config.SGXEPCSize != 0 {
+		q.sgxEPCSize = config.SGXEPCSize
+		if q.qemuMachine.Options != "" {
+			q.qemuMachine.Options += ","
+		}
+		// qemu sandboxes will only support one EPC per sandbox
+		// this is because there is only one annotation (sgx.intel.com/epc)
+		// to specify the size of the EPC.
+		q.qemuMachine.Options += "sgx-epc.0.memdev=epc0,sgx-epc.0.node=0"
+	}
+
+	if err := q.handleImagePath(config); err != nil {
+		return nil, err
+	}
 
 	return q, nil
 }
 
-func (q *qemuAmd64) capabilities() types.Capabilities {
+func (q *qemuAmd64) capabilities(hConfig HypervisorConfig) types.Capabilities {
 	var caps types.Capabilities
 
 	if q.qemuMachine.Type == QemuQ35 ||
 		q.qemuMachine.Type == QemuVirt {
 		caps.SetBlockDeviceHotplugSupport()
+		caps.SetNetworkDeviceHotplugSupported()
 	}
 
 	caps.SetMultiQueueSupport()
-	caps.SetFsSharingSupport()
+	if hConfig.SharedFS != config.NoSharedFS {
+		caps.SetFsSharingSupport()
+	}
 
 	return caps
 }
@@ -169,13 +181,15 @@ func (q *qemuAmd64) bridges(number uint32) {
 }
 
 func (q *qemuAmd64) cpuModel() string {
+	var err error
 	cpuModel := defaultCPUModel
 
-	// VMX is not migratable yet.
-	// issue: https://github.com/kata-containers/runtime/issues/1750
-	if q.vmFactory {
-		virtLog.WithField("subsystem", "qemuAmd64").Warn("VMX is not migratable yet: turning it off")
-		cpuModel += ",vmx=off"
+	// Temporary until QEMU cpu model 'host' supports AMD SEV-SNP
+	protection, err := availableGuestProtection()
+	if err == nil {
+		if protection == snpProtection && q.snpGuest {
+			cpuModel = "EPYC-v4"
+		}
 	}
 
 	return cpuModel
@@ -188,7 +202,11 @@ func (q *qemuAmd64) memoryTopology(memoryMb, hostMemoryMb uint64, slots uint8) g
 // Is Memory Hotplug supported by this architecture/machine type combination?
 func (q *qemuAmd64) supportGuestMemoryHotplug() bool {
 	// true for all amd64 machine types except for microvm.
-	return q.qemuMachine.Type != govmmQemu.MachineTypeMicrovm
+	if q.qemuMachine.Type == govmmQemu.MachineTypeMicrovm {
+		return false
+	}
+
+	return q.protection == noneProtection
 }
 
 func (q *qemuAmd64) appendImage(ctx context.Context, devices []govmmQemu.Device, path string) ([]govmmQemu.Device, error) {
@@ -198,11 +216,6 @@ func (q *qemuAmd64) appendImage(ctx context.Context, devices []govmmQemu.Device,
 	return q.appendBlockImage(ctx, devices, path)
 }
 
-// appendBridges appends to devices the given bridges
-func (q *qemuAmd64) appendBridges(devices []govmmQemu.Device) []govmmQemu.Device {
-	return genericAppendBridges(devices, q.Bridges, q.qemuMachine.Type)
-}
-
 // enable protection
 func (q *qemuAmd64) enableProtection() error {
 	var err error
@@ -210,7 +223,12 @@ func (q *qemuAmd64) enableProtection() error {
 	if err != nil {
 		return err
 	}
-	logger := virtLog.WithFields(logrus.Fields{
+	// Configure SNP only if specified in config
+	if q.protection == snpProtection && !q.snpGuest {
+		q.protection = sevProtection
+	}
+
+	logger := hvLogger.WithFields(logrus.Fields{
 		"subsystem":               "qemuAmd64",
 		"machine":                 q.qemuMachine,
 		"kernel-params-debug":     q.kernelParamsDebug,
@@ -222,8 +240,7 @@ func (q *qemuAmd64) enableProtection() error {
 		if q.qemuMachine.Options != "" {
 			q.qemuMachine.Options += ","
 		}
-		q.qemuMachine.Options += "kvm-type=tdx,confidential-guest-support=tdx"
-		q.kernelParams = append(q.kernelParams, Param{"tdx_guest", ""})
+		q.qemuMachine.Options += "confidential-guest-support=tdx"
 		logger.Info("Enabling TDX guest protection")
 		return nil
 	case sevProtection:
@@ -232,6 +249,13 @@ func (q *qemuAmd64) enableProtection() error {
 		}
 		q.qemuMachine.Options += "confidential-guest-support=sev"
 		logger.Info("Enabling SEV guest protection")
+		return nil
+	case snpProtection:
+		if q.qemuMachine.Options != "" {
+			q.qemuMachine.Options += ","
+		}
+		q.qemuMachine.Options += "confidential-guest-support=snp"
+		logger.Info("Enabling SNP guest protection")
 		return nil
 
 	// TODO: Add support for other x86_64 technologies
@@ -242,19 +266,31 @@ func (q *qemuAmd64) enableProtection() error {
 }
 
 // append protection device
-func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware string) ([]govmmQemu.Device, string, error) {
+func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+	if q.sgxEPCSize != 0 {
+		devices = append(devices,
+			govmmQemu.Object{
+				Type:     govmmQemu.MemoryBackendEPC,
+				ID:       "epc0",
+				Prealloc: true,
+				Size:     uint64(q.sgxEPCSize),
+			})
+	}
+
 	switch q.protection {
 	case tdxProtection:
 		id := q.devLoadersCount
 		q.devLoadersCount += 1
 		return append(devices,
 			govmmQemu.Object{
-				Driver:   govmmQemu.Loader,
-				Type:     govmmQemu.TDXGuest,
-				ID:       "tdx",
-				DeviceID: fmt.Sprintf("fd%d", id),
-				Debug:    false,
-				File:     firmware,
+				Driver:         govmmQemu.Loader,
+				Type:           govmmQemu.TDXGuest,
+				QgsPort:        q.qgsPort,
+				ID:             "tdx",
+				DeviceID:       fmt.Sprintf("fd%d", id),
+				Debug:          false,
+				File:           firmware,
+				FirmwareVolume: firmwareVolume,
 			}), "", nil
 	case sevProtection:
 		return append(devices,
@@ -264,9 +300,20 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware 
 				Debug:           false,
 				File:            firmware,
 				CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
-				ReducedPhysBits: cpuid.AMDMemEncrypt.PhysAddrReduction,
+				ReducedPhysBits: 1,
+			}), "", nil
+	case snpProtection:
+		return append(devices,
+			govmmQemu.Object{
+				Type:            govmmQemu.SNPGuest,
+				ID:              "snp",
+				Debug:           false,
+				File:            firmware,
+				CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
+				ReducedPhysBits: 1,
 			}), "", nil
 	case noneProtection:
+
 		return devices, firmware, nil
 
 	default:

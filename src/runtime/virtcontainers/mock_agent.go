@@ -9,13 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	"context"
 	persistapi "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/api"
 	pbTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
-	vcTypes "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/net/context"
 )
 
 // mockAgent is an empty Agent implementation, for testing and
@@ -122,6 +121,11 @@ func (n *mockAgent) listRoutes(ctx context.Context) ([]*pbTypes.Route, error) {
 	return nil, nil
 }
 
+// updateEphemeralMounts is the Noop agent updateEphemeralMounts implementation. It does nothing.
+func (n *mockAgent) updateEphemeralMounts(ctx context.Context, storages []*grpc.Storage) error {
+	return nil
+}
+
 // check is the Noop agent health checker. It does nothing.
 func (n *mockAgent) check(ctx context.Context) error {
 	return nil
@@ -135,6 +139,11 @@ func (n *mockAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Cont
 // waitProcess is the Noop agent process waiter. It does nothing.
 func (n *mockAgent) waitProcess(ctx context.Context, c *Container, processID string) (int32, error) {
 	return 0, nil
+}
+
+// removeStaleVirtiofsShareMounts is the Noop agent removeStaleVirtiofsShareMounts implementation. It does nothing.
+func (n *mockAgent) removeStaleVirtiofsShareMounts(ctx context.Context) error {
+	return nil
 }
 
 // winsizeProcess is the Noop agent process tty resizer. It does nothing.
@@ -173,11 +182,11 @@ func (n *mockAgent) resumeContainer(ctx context.Context, sandbox *Sandbox, c Con
 }
 
 // configure is the Noop agent configuration implementation. It does nothing.
-func (n *mockAgent) configure(ctx context.Context, h hypervisor, id, sharePath string, config KataAgentConfig) error {
+func (n *mockAgent) configure(ctx context.Context, h Hypervisor, id, sharePath string, config KataAgentConfig) error {
 	return nil
 }
 
-func (n *mockAgent) configureFromGrpc(ctx context.Context, h hypervisor, id string, config KataAgentConfig) error {
+func (n *mockAgent) configureFromGrpc(ctx context.Context, h Hypervisor, id string, config KataAgentConfig) error {
 	return nil
 }
 
@@ -217,14 +226,14 @@ func (n *mockAgent) copyFile(ctx context.Context, src, dst string) error {
 }
 
 // addSwap is the Noop agent setup swap. It does nothing.
-func (n *mockAgent) addSwap(ctx context.Context, PCIPath vcTypes.PciPath) error {
+func (n *mockAgent) addSwap(ctx context.Context, PCIPath types.PciPath) error {
 	return nil
 }
 
 func (n *mockAgent) markDead(ctx context.Context) {
 }
 
-func (n *mockAgent) cleanup(ctx context.Context, s *Sandbox) {
+func (n *mockAgent) cleanup(ctx context.Context) {
 }
 
 // save is the Noop agent state saver. It does nothing.
@@ -241,4 +250,24 @@ func (n *mockAgent) getOOMEvent(ctx context.Context) (string, error) {
 
 func (n *mockAgent) getAgentMetrics(ctx context.Context, req *grpc.GetMetricsRequest) (*grpc.Metrics, error) {
 	return nil, nil
+}
+
+func (n *mockAgent) getGuestVolumeStats(ctx context.Context, volumeGuestPath string) ([]byte, error) {
+	return nil, nil
+}
+
+func (n *mockAgent) resizeGuestVolume(ctx context.Context, volumeGuestPath string, size uint64) error {
+	return nil
+}
+
+func (k *mockAgent) getIPTables(ctx context.Context, isIPv6 bool) ([]byte, error) {
+	return nil, nil
+}
+
+func (k *mockAgent) setIPTables(ctx context.Context, isIPv6 bool, data []byte) error {
+	return nil
+}
+
+func (k *mockAgent) setPolicy(ctx context.Context, policy string) error {
+	return nil
 }

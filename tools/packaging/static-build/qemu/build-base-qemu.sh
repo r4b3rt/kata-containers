@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018 Intel Corporation
 #
@@ -9,9 +9,16 @@ set -o nounset
 set -o pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly qemu_builder="${script_dir}/build-qemu.sh"
 
 source "${script_dir}/../../scripts/lib.sh"
 source "${script_dir}/../qemu.blacklist"
+
+ARCH=${ARCH:-$(uname -m)}
+dpkg_arch=":${ARCH}"
+[ ${dpkg_arch} == ":aarch64" ] && dpkg_arch=":arm64"
+[ ${dpkg_arch} == ":x86_64" ] && dpkg_arch=""
+[ "${dpkg_arch}" == ":ppc64le" ] && dpkg_arch=":ppc64el"
 
 packaging_dir="${script_dir}/../.."
 qemu_destdir="/tmp/qemu-static/"
@@ -34,24 +41,37 @@ prefix="${prefix:-"/opt/kata"}"
 
 CACHE_TIMEOUT=$(date +"%Y-%m-%d")
 
-sudo "${container_engine}" build \
+[ -n "${build_suffix}" ] && HYPERVISOR_NAME="kata-qemu-${build_suffix}" || HYPERVISOR_NAME="kata-qemu"
+[ -n "${build_suffix}" ] && PKGVERSION="kata-static-${build_suffix}" || PKGVERSION="kata-static"
+
+container_image="${QEMU_CONTAINER_BUILDER:-$(get_qemu_image_name)}"
+[ "${CROSS_BUILD}" == "true" ] && container_image="${container_image}-cross-build"
+
+${container_engine} pull ${container_image} || ("${container_engine}" build \
 	--build-arg CACHE_TIMEOUT="${CACHE_TIMEOUT}" \
-	--build-arg BUILD_SUFFIX="${build_suffix}" \
 	--build-arg http_proxy="${http_proxy}" \
 	--build-arg https_proxy="${https_proxy}" \
-	--build-arg QEMU_DESTDIR="${qemu_destdir}" \
-	--build-arg QEMU_REPO="${qemu_repo}" \
-	--build-arg QEMU_VERSION="${qemu_version}" \
-	--build-arg QEMU_TARBALL="${qemu_tar}" \
-	--build-arg PREFIX="${prefix}" \
+	--build-arg DPKG_ARCH="${dpkg_arch}" \
+	--build-arg ARCH="${ARCH}" \
 	"${packaging_dir}" \
 	-f "${script_dir}/Dockerfile" \
-	-t qemu-static
+	-t "${container_image}" && \
+	# No-op unless PUSH_TO_REGISTRY is exported as "yes"
+	push_to_registry "${container_image}")
 
-sudo "${container_engine}" run \
-	--rm \
-	-i \
-	-v "${PWD}":/share qemu-static \
-	mv "${qemu_destdir}/${qemu_tar}" /share/
+"${container_engine}" run --rm -i \
+	--env BUILD_SUFFIX="${build_suffix}" \
+	--env PKGVERSION="${PKGVERSION}" \
+	--env QEMU_DESTDIR="${qemu_destdir}" \
+	--env QEMU_REPO="${qemu_repo}" \
+	--env QEMU_TARBALL="${qemu_tar}" \
+	--env PREFIX="${prefix}" \
+	--env HYPERVISOR_NAME="${HYPERVISOR_NAME}" \
+	--env QEMU_VERSION_NUM="${qemu_version}" \
+	--env ARCH="${ARCH}" \
+	--user "$(id -u)":"$(id -g)" \
+	-w "${PWD}" \
+	-v "${repo_root_dir}:${repo_root_dir}" \
+	-v "${PWD}":/share "${container_image}" \
+	bash -c "${qemu_builder}"
 
-sudo chown ${USER}:${USER} "${PWD}/${qemu_tar}"

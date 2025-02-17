@@ -7,6 +7,7 @@
 package persistapi
 
 import (
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -35,10 +36,6 @@ type HypervisorConfig struct {
 	// HypervisorPath is the hypervisor executable host path.
 	HypervisorPath string
 
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
-	HypervisorCtlPath string
-
-	// HypervisorCtlPath is the hypervisor ctl executable host path.
 	// JailerPath is the jailer executable host path.
 	JailerPath string
 
@@ -70,7 +67,7 @@ type HypervisorConfig struct {
 	// VirtioFSDaemon is the virtio-fs vhost-user daemon path
 	VirtioFSDaemon string
 
-	// VirtioFSCache cache mode for fs version cache or "none"
+	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
 	// File based memory backend root directory
@@ -79,6 +76,9 @@ type HypervisorConfig struct {
 	// VhostUserStorePath is the directory path where vhost-user devices
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
+
+	// SeccompSandbox is the qemu function which enables the seccomp feature
+	SeccompSandbox string
 
 	// GuestHookPath is the path within the VM that will be used for 'drop-in' hooks
 	GuestHookPath string
@@ -89,9 +89,6 @@ type HypervisorConfig struct {
 
 	// HypervisorPathList is the list of hypervisor paths names allowed in annotations
 	HypervisorPathList []string
-
-	// HypervisorCtlPathList is the list of hypervisor control paths names allowed in annotations
-	HypervisorCtlPathList []string
 
 	// JailerPathList is the list of jailer paths names allowed in annotations
 	JailerPathList []string
@@ -127,12 +124,8 @@ type HypervisorConfig struct {
 	// Enable SGX. Hardware-based isolation and memory encryption.
 	SGXEPCSize int64
 
-	// PCIeRootPort is used to indicate the number of PCIe Root Port devices
-	// The PCIe Root Port device is used to hot-plug the PCIe device
-	PCIeRootPort uint32
-
 	// NumVCPUs specifies default number of vCPUs for the VM.
-	NumVCPUs uint32
+	NumVCPUsF float32
 
 	//DefaultMaxVCPUs specifies the maximum number of vCPUs for the VM.
 	DefaultMaxVCPUs uint32
@@ -184,14 +177,6 @@ type HypervisorConfig struct {
 	// VirtioMem is used to enable/disable virtio-mem
 	VirtioMem bool
 
-	// Realtime Used to enable/disable realtime
-	Realtime bool
-
-	// Mlock is used to control memory locking when Realtime is enabled
-	// Realtime=true and Mlock=false, allows for swapping out of VM memory
-	// enabling higher density
-	Mlock bool
-
 	// DisableNestingChecks is used to override customizations performed
 	// when running on top of another VMM.
 	DisableNestingChecks bool
@@ -199,9 +184,19 @@ type HypervisorConfig struct {
 	// DisableImageNvdimm disables nvdimm for guest rootfs image
 	DisableImageNvdimm bool
 
-	// HotplugVFIOOnRootBus is used to indicate if devices need to be hotplugged on the
-	// root bus instead of a bridge.
-	HotplugVFIOOnRootBus bool
+	// HotPlugVFIO is used to indicate if devices need to be hotplugged on the
+	// root, switch, bridge or no-port
+	HotPlugVFIO config.PCIePort
+
+	// ColdPlugVFIO is used to indicate if devices need to be coldplugged on the
+	// root, bridge, switch or no-port
+	ColdPlugVFIO config.PCIePort
+
+	// PCIeRootPort is the number of ports needed in the hypvervisor
+	PCIeRootPort uint32
+
+	// PCIeSwitchPort is the number of ports needed in the hypvervisor
+	PCIeSwitchPort uint32
 
 	// BootToBeTemplate used to indicate if the VM is created to be a template VM
 	BootToBeTemplate bool
@@ -231,9 +226,9 @@ type ShimConfig struct {
 
 // NetworkConfig is the network configuration related to a network.
 type NetworkConfig struct {
-	NetNSPath         string
-	NetNsCreated      bool
-	DisableNewNetNs   bool
+	NetworkID         string
+	NetworkCreated    bool
+	DisableNewNetwork bool
 	InterworkingModel int
 }
 
@@ -248,19 +243,6 @@ type ContainerConfig struct {
 // SandboxConfig is a sandbox configuration.
 // Refs: virtcontainers/sandbox.go:SandboxConfig
 type SandboxConfig struct {
-	// Information for fields not saved:
-	// * Annotation: this is kind of casual data, we don't need casual data in persist file,
-	// 				if you know this data needs to persist, please gives it
-	//				a specific field
-
-	ContainerConfigs []ContainerConfig
-
-	// SandboxBindMounts - list of paths to mount into guest
-	SandboxBindMounts []string
-
-	// Experimental enables experimental features
-	Experimental []string
-
 	// Cgroups specifies specific cgroup settings for the various subsystems that the container is
 	// placed into to limit the resources the container has available
 	Cgroups *configs.Cgroup `json:"cgroups"`
@@ -270,8 +252,24 @@ type SandboxConfig struct {
 
 	KataShimConfig *ShimConfig
 
-	HypervisorType   string
-	NetworkConfig    NetworkConfig
+	// Custom SELinux security policy to the container process inside the VM
+	GuestSeLinuxLabel string
+
+	HypervisorType string
+
+	// SandboxBindMounts - list of paths to mount into guest
+	SandboxBindMounts []string
+
+	// Experimental enables experimental features
+	Experimental []string
+
+	// Information for fields not saved:
+	// * Annotation: this is kind of casual data, we don't need casual data in persist file,
+	// if you know this data needs to persist, please gives it a specific field
+	ContainerConfigs []ContainerConfig
+
+	NetworkConfig NetworkConfig
+
 	HypervisorConfig HypervisorConfig
 
 	ShmSize uint64
@@ -290,4 +288,7 @@ type SandboxConfig struct {
 	SandboxCgroupOnly bool
 
 	DisableGuestSeccomp bool
+
+	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
+	EnableVCPUsPinning bool
 }

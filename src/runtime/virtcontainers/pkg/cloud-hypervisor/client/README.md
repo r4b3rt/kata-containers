@@ -17,13 +17,59 @@ Install the following dependencies:
 go get github.com/stretchr/testify/assert
 go get golang.org/x/oauth2
 go get golang.org/x/net/context
-go get github.com/antihax/optional
 ```
 
 Put the package under your project folder and add the following in import:
 
 ```golang
-import "./openapi"
+import sw "./openapi"
+```
+
+To use a proxy, set the environment variable `HTTP_PROXY`:
+
+```golang
+os.Setenv("HTTP_PROXY", "http://proxy_name:proxy_port")
+```
+
+## Configuration of Server URL
+
+Default configuration comes with `Servers` field that contains server objects as defined in the OpenAPI specification.
+
+### Select Server Configuration
+
+For using other server than the one defined on index 0 set context value `sw.ContextServerIndex` of type `int`.
+
+```golang
+ctx := context.WithValue(context.Background(), sw.ContextServerIndex, 1)
+```
+
+### Templated Server URL
+
+Templated server URL is formatted using default variables from configuration or from context value `sw.ContextServerVariables` of type `map[string]string`.
+
+```golang
+ctx := context.WithValue(context.Background(), sw.ContextServerVariables, map[string]string{
+	"basePath": "v2",
+})
+```
+
+Note, enum values are always validated and all unused variables are silently ignored.
+
+### URLs Configuration per Operation
+
+Each operation can use different server URL defined using `OperationServers` map in the `Configuration`.
+An operation is uniquely identified by `"{classname}Service.{nickname}"` string.
+Similar rules for overriding default operation server index and variables applies by using `sw.ContextOperationServerIndices` and `sw.ContextOperationServerVariables` context maps.
+
+```
+ctx := context.WithValue(context.Background(), sw.ContextOperationServerIndices, map[string]int{
+	"{classname}Service.{nickname}": 2,
+})
+ctx = context.WithValue(context.Background(), sw.ContextOperationServerVariables, map[string]map[string]string{
+	"{classname}Service.{nickname}": {
+		"port": "8443",
+	},
+})
 ```
 
 ## Documentation for API Endpoints
@@ -46,44 +92,61 @@ Class | Method | HTTP request | Description
 *DefaultApi* | [**VmAddFsPut**](docs/DefaultApi.md#vmaddfsput) | **Put** /vm.add-fs | Add a new virtio-fs device to the VM
 *DefaultApi* | [**VmAddNetPut**](docs/DefaultApi.md#vmaddnetput) | **Put** /vm.add-net | Add a new network device to the VM
 *DefaultApi* | [**VmAddPmemPut**](docs/DefaultApi.md#vmaddpmemput) | **Put** /vm.add-pmem | Add a new pmem device to the VM
+*DefaultApi* | [**VmAddUserDevicePut**](docs/DefaultApi.md#vmadduserdeviceput) | **Put** /vm.add-user-device | Add a new userspace device to the VM
+*DefaultApi* | [**VmAddVdpaPut**](docs/DefaultApi.md#vmaddvdpaput) | **Put** /vm.add-vdpa | Add a new vDPA device to the VM
 *DefaultApi* | [**VmAddVsockPut**](docs/DefaultApi.md#vmaddvsockput) | **Put** /vm.add-vsock | Add a new vsock device to the VM
+*DefaultApi* | [**VmCoredumpPut**](docs/DefaultApi.md#vmcoredumpput) | **Put** /vm.coredump | Takes a VM coredump.
 *DefaultApi* | [**VmCountersGet**](docs/DefaultApi.md#vmcountersget) | **Get** /vm.counters | Get counters from the VM
 *DefaultApi* | [**VmInfoGet**](docs/DefaultApi.md#vminfoget) | **Get** /vm.info | Returns general information about the cloud-hypervisor Virtual Machine (VM) instance.
+*DefaultApi* | [**VmReceiveMigrationPut**](docs/DefaultApi.md#vmreceivemigrationput) | **Put** /vm.receive-migration | Receive a VM migration from URL
 *DefaultApi* | [**VmRemoveDevicePut**](docs/DefaultApi.md#vmremovedeviceput) | **Put** /vm.remove-device | Remove a device from the VM
 *DefaultApi* | [**VmResizePut**](docs/DefaultApi.md#vmresizeput) | **Put** /vm.resize | Resize the VM
 *DefaultApi* | [**VmResizeZonePut**](docs/DefaultApi.md#vmresizezoneput) | **Put** /vm.resize-zone | Resize a memory zone
 *DefaultApi* | [**VmRestorePut**](docs/DefaultApi.md#vmrestoreput) | **Put** /vm.restore | Restore a VM from a snapshot.
+*DefaultApi* | [**VmSendMigrationPut**](docs/DefaultApi.md#vmsendmigrationput) | **Put** /vm.send-migration | Send a VM migration to URL
 *DefaultApi* | [**VmSnapshotPut**](docs/DefaultApi.md#vmsnapshotput) | **Put** /vm.snapshot | Returns a VM snapshot.
+*DefaultApi* | [**VmmNmiPut**](docs/DefaultApi.md#vmmnmiput) | **Put** /vmm.nmi | Inject an NMI.
 *DefaultApi* | [**VmmPingGet**](docs/DefaultApi.md#vmmpingget) | **Get** /vmm.ping | Ping the VMM to check for API server availability
 
 
 ## Documentation For Models
 
  - [BalloonConfig](docs/BalloonConfig.md)
- - [CmdLineConfig](docs/CmdLineConfig.md)
  - [ConsoleConfig](docs/ConsoleConfig.md)
+ - [CpuAffinity](docs/CpuAffinity.md)
+ - [CpuFeatures](docs/CpuFeatures.md)
  - [CpuTopology](docs/CpuTopology.md)
  - [CpusConfig](docs/CpusConfig.md)
+ - [DebugConsoleConfig](docs/DebugConsoleConfig.md)
  - [DeviceConfig](docs/DeviceConfig.md)
  - [DeviceNode](docs/DeviceNode.md)
  - [DiskConfig](docs/DiskConfig.md)
  - [FsConfig](docs/FsConfig.md)
- - [InitramfsConfig](docs/InitramfsConfig.md)
- - [KernelConfig](docs/KernelConfig.md)
+ - [LandlockConfig](docs/LandlockConfig.md)
  - [MemoryConfig](docs/MemoryConfig.md)
  - [MemoryZoneConfig](docs/MemoryZoneConfig.md)
  - [NetConfig](docs/NetConfig.md)
  - [NumaConfig](docs/NumaConfig.md)
  - [NumaDistance](docs/NumaDistance.md)
+ - [PayloadConfig](docs/PayloadConfig.md)
  - [PciDeviceInfo](docs/PciDeviceInfo.md)
+ - [PciSegmentConfig](docs/PciSegmentConfig.md)
+ - [PlatformConfig](docs/PlatformConfig.md)
  - [PmemConfig](docs/PmemConfig.md)
+ - [RateLimitGroupConfig](docs/RateLimitGroupConfig.md)
  - [RateLimiterConfig](docs/RateLimiterConfig.md)
+ - [ReceiveMigrationData](docs/ReceiveMigrationData.md)
  - [RestoreConfig](docs/RestoreConfig.md)
  - [RngConfig](docs/RngConfig.md)
+ - [SendMigrationData](docs/SendMigrationData.md)
  - [SgxEpcConfig](docs/SgxEpcConfig.md)
  - [TokenBucket](docs/TokenBucket.md)
- - [VmAddDevice](docs/VmAddDevice.md)
+ - [TpmConfig](docs/TpmConfig.md)
+ - [VdpaConfig](docs/VdpaConfig.md)
+ - [VirtQueueAffinity](docs/VirtQueueAffinity.md)
+ - [VmAddUserDevice](docs/VmAddUserDevice.md)
  - [VmConfig](docs/VmConfig.md)
+ - [VmCoredumpData](docs/VmCoredumpData.md)
  - [VmInfo](docs/VmInfo.md)
  - [VmRemoveDevice](docs/VmRemoveDevice.md)
  - [VmResize](docs/VmResize.md)
@@ -98,6 +161,21 @@ Class | Method | HTTP request | Description
  Endpoints do not require authorization.
 
 
+## Documentation for Utility Methods
+
+Due to the fact that model structure members are all pointers, this package contains
+a number of utility functions to easily obtain pointers to values of basic types.
+Each of these functions takes a value of the given basic type and returns a pointer to it:
+
+* `PtrBool`
+* `PtrInt`
+* `PtrInt32`
+* `PtrInt64`
+* `PtrFloat`
+* `PtrFloat32`
+* `PtrFloat64`
+* `PtrString`
+* `PtrTime`
 
 ## Author
 

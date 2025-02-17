@@ -1,39 +1,19 @@
-#
-# Copyright (c) 2018 Intel Corporation
+# Copyright (c) 2018 Intel Corporation, 2021 IBM Corp.
 #
 # SPDX-License-Identifier: Apache-2.0
 
-ARG IMAGE_REGISTRY=registry.centos.org
-FROM ${IMAGE_REGISTRY}/centos:@OS_VERSION@
-
+FROM quay.io/centos/centos:@OS_VERSION@
 @SET_PROXY@
 
-RUN yum -y update && yum install -y \
-    autoconf \
-    automake \
-    binutils \
-    chrony \
-    coreutils \
-    curl \
-    gcc \
-    gcc-c++ \
+RUN dnf -y update && \
+    dnf -y install dnf-plugins-core && \
+    dnf config-manager --set-enabled crb && \
+    dnf -y install \
+    diffutils \
+    file \
+    g++ \
     git \
-    glibc-common \
-    glibc-devel \
-    glibc-headers \
-    glibc-static \
-    glibc-utils \
-    libseccomp \
-    libseccomp-devel \
-    libstdc++-devel \
-    libstdc++-static \
-    m4 \
-    make \
-    sed \
-    tar \
-    vim \
-    which
+    protobuf-compiler \
+    xz
 
-# This will install the proper packages to build Kata components
-@INSTALL_MUSL@
 @INSTALL_RUST@

@@ -4,11 +4,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-set -e
+[ -z "${DEBUG}" ] || set -x
 
-[ -n "${DEBUG}" ] && set -x
+set -o errexit
+# set -o nounset
+set -o pipefail
 
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
+MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
+
+#For cross build
+CROSS_BUILD=${CROSS_BUILD:-false}
+BUILDX=""
+PLATFORM=""
+TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
+ARCH=${ARCH:-$(uname -m)}
+[ "${TARGET_ARCH}" == "aarch64" ] && TARGET_ARCH=arm64
+TARGET_OS=${TARGET_OS:-linux}
+[ "${CROSS_BUILD}" == "true" ] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
 
 readonly script_name="${0##*/}"
 readonly script_dir=$(dirname "$(readlink -f "$0")")
@@ -36,32 +49,10 @@ readonly dax_header_sz=2
 # [2] - https://nvdimm.wiki.kernel.org/2mib_fs_dax
 readonly dax_alignment=2
 
-# The list of systemd units and files that are not needed in Kata Containers
-readonly -a systemd_units=(
-	"systemd-coredump@"
-	"systemd-journald"
-	"systemd-journald-dev-log"
-	"systemd-journal-flush"
-	"systemd-random-seed"
-	"systemd-timesyncd"
-	"systemd-tmpfiles-setup"
-	"systemd-udevd"
-	"systemd-udevd-control"
-	"systemd-udevd-kernel"
-	"systemd-udev-trigger"
-	"systemd-update-utmp"
-)
-
-readonly -a systemd_files=(
-	"systemd-bless-boot-generator"
-	"systemd-fstab-generator"
-	"systemd-getty-generator"
-	"systemd-gpt-auto-generator"
-	"systemd-tmpfiles-cleanup.timer"
-)
-
 # Set a default value
 AGENT_INIT=${AGENT_INIT:-no}
+SELINUX=${SELINUX:-no}
+SELINUXFS="/sys/fs/selinux"
 
 # Align image to 128M
 readonly mem_boundary_mb=128
@@ -70,27 +61,31 @@ readonly mem_boundary_mb=128
 source "${lib_file}"
 
 usage() {
-	cat <<EOT
+	cat <<EOF
 Usage: ${script_name} [options] <rootfs-dir>
 	This script will create a Kata Containers image file of
 	an adequate size based on the <rootfs-dir> directory.
 
 Options:
 	-h Show this help
-	-o path to generate image file ENV: IMAGE
-	-r Free space of the root partition in MB ENV: ROOT_FREE_SPACE
+	-o Path to generate image file. ENV: IMAGE
+	-r Free space of the root partition in MB. ENV: ROOT_FREE_SPACE
+	-f Filesystem type to use, only ext4, xfs and erofs are supported. ENV: FS_TYPE
 
 Extra environment variables:
 	AGENT_BIN:      Use it to change the expected agent binary name
 	AGENT_INIT:     Use kata agent as init process
+	BLOCK_SIZE:     Use to specify the size of blocks in bytes. DEFAULT: 4096
 	IMAGE_REGISTRY: Hostname for the image registry used to pull down the rootfs build image.
-	FS_TYPE:        Filesystem type to use. Only xfs and ext4 are supported.
 	NSDAX_BIN:      Use to specify path to pre-compiled 'nsdax' tool.
 	USE_DOCKER:     If set will build image in a Docker Container (requries docker)
 	                DEFAULT: not set
 	USE_PODMAN:     If set and USE_DOCKER not set, will build image in a Podman Container (requries podman)
 	                DEFAULT: not set
-
+	SELINUX:        If set to "yes", the rootfs is labeled for SELinux.
+	                Make sure that selinuxfs is mounted to /sys/fs/selinux on the host
+	                and the rootfs is built with SELINUX=yes.
+	                DEFAULT value: "no"
 
 Following diagram shows how the resulting image will look like
 
@@ -114,7 +109,7 @@ Kernels and hypervisors that support DAX/NVDIMM read the MBR #2, otherwise MBR #
 [1] - https://github.com/kata-containers/kata-containers/blob/main/tools/osbuilder/image-builder/nsdax.gpl.c
 [2] - https://github.com/torvalds/linux/blob/master/drivers/nvdimm/pfn.h
 
-EOT
+EOF
 }
 
 
@@ -131,17 +126,21 @@ build_with_container() {
 	local nsdax_bin="$9"
 	local container_image_name="image-builder-osbuilder"
 	local shared_files=""
+	local selinuxfs=""
 
 	image_dir=$(readlink -f "$(dirname "${image}")")
 	image_name=$(basename "${image}")
 
-	REGISTRY_ARG=""
+	engine_build_args=""
 	if [ -n "${IMAGE_REGISTRY}" ]; then
-		REGISTRY_ARG="--build-arg IMAGE_REGISTRY=${IMAGE_REGISTRY}"
+		engine_build_args+=" --build-arg IMAGE_REGISTRY=${IMAGE_REGISTRY}"
+	fi
+	if [ -n "${USE_PODMAN}" ]; then
+		engine_build_args+=" --runtime ${DOCKER_RUNTIME}"
 	fi
 
-	"${container_engine}" build  \
-		   ${REGISTRY_ARG} \
+	"${container_engine}" ${BUILDX} build ${PLATFORM}  \
+		   ${engine_build_args} \
 		   --build-arg http_proxy="${http_proxy}" \
 		   --build-arg https_proxy="${https_proxy}" \
 		   -t "${container_image_name}" "${script_dir}"
@@ -149,6 +148,14 @@ build_with_container() {
 	readonly mke2fs_conf="/etc/mke2fs.conf"
 	if [ -f "${mke2fs_conf}" ]; then
 		shared_files+="-v ${mke2fs_conf}:${mke2fs_conf}:ro "
+	fi
+
+	if [ "${SELINUX}" == "yes" ]; then
+		if mountpoint $SELINUXFS > /dev/null; then
+			selinuxfs="-v ${SELINUXFS}:${SELINUXFS}"
+		else
+			die "Make sure that SELinux is enabled on the host"
+		fi
 	fi
 
 	#Make sure we use a compatible runtime to build rootfs
@@ -164,12 +171,19 @@ build_with_container() {
 		   --env BLOCK_SIZE="${block_size}" \
 		   --env ROOT_FREE_SPACE="${root_free_space}" \
 		   --env NSDAX_BIN="${nsdax_bin}" \
+		   --env MEASURED_ROOTFS="${MEASURED_ROOTFS}" \
+		   --env SELINUX="${SELINUX}" \
 		   --env DEBUG="${DEBUG}" \
+		   --env ARCH="${ARCH}" \
+		   --env TARGET_ARCH="${TARGET_ARCH}" \
+		   --env USER="$(id -u)" \
+		   --env GROUP="$(id -g)" \
 		   -v /dev:/dev \
 		   -v "${script_dir}":"/osbuilder" \
 		   -v "${script_dir}/../scripts":"/scripts" \
 		   -v "${rootfs}":"/rootfs" \
 		   -v "${image_dir}":"/image" \
+		   ${selinuxfs} \
 		   ${shared_files} \
 		   ${container_image_name} \
 		   bash "/osbuilder/${script_name}" -o "/image/${image_name}" /rootfs
@@ -242,7 +256,7 @@ calculate_required_disk_size() {
 	local fs_type="$2"
 	local block_size="$3"
 
-	readonly rootfs_size_mb=$(du -B 1MB -s "${rootfs}" | awk '{print $1}')
+	readonly rootfs_size_mb=$(du -B 1M -s "${rootfs}" | awk '{print $1}')
 	readonly image="$(mktemp)"
 	readonly mount_dir="$(mktemp -d)"
 	readonly max_tries=20
@@ -328,12 +342,14 @@ format_loop() {
 	local device="$1"
 	local block_size="$2"
 	local fs_type="$3"
+	local mount_dir="$4"
 
 	case "${fs_type}" in
 		"${ext4_format}")
 			mkfs.ext4 -q -F -b "${block_size}" "${device}p1"
 			info "Set filesystem reserved blocks percentage to ${reserved_blocks_percentage}%"
 			tune2fs -m "${reserved_blocks_percentage}" "${device}p1"
+      return 0
 			;;
 
 		"${xfs_format}")
@@ -343,7 +359,8 @@ format_loop() {
 			if mkfs.xfs -m reflink=0 -q -f -b size="${block_size}" "${device}p1" 2>&1 | grep -q "unknown option"; then
 				mkfs.xfs -q -f -b size="${block_size}" "${device}p1"
 			fi
-			;;
+      return 0
+    	;;
 
 		*)
 			error "Unsupported fs type: ${fs_type}"
@@ -365,11 +382,57 @@ create_disk() {
 	# Kata runtime expect an image with just one partition
 	# The partition is the rootfs content
 	info "Creating partitions"
+
+	if [ "${rootfs_end}" == "-1" ]; then
+		rootfs_end_unit="s"
+	else
+		rootfs_end_unit="MiB"
+	fi
+	if [ "${MEASURED_ROOTFS}" == "yes" ]; then
+		info "Creating partitions with hash device"
+		# The hash data will take less than one percent disk space to store
+		hash_start=$(echo $img_size | awk '{print $1 * 0.99}' |cut -d $(locale decimal_point) -f 1)
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${hash_start}MiB "
+		partition_param+="mkpart primary ${fs_type} ${hash_start}MiB ${rootfs_end}${rootfs_end_unit} "
+		partition_param+="set 1 boot on"
+	else
+		partition_param="mkpart primary ${fs_type} ${part_start}MiB ${rootfs_end}${rootfs_end_unit}"
+	fi
+
 	parted -s -a optimal "${image}" -- \
 		   mklabel msdos \
-		   mkpart primary "${fs_type}" "${part_start}"M "${rootfs_end}"M
+		   "${partition_param}"
 
 	OK "Partitions created"
+}
+
+setup_selinux() {
+		local mount_dir="$1"
+		local agent_bin="$2"
+
+		if [ "${SELINUX}" == "yes" ]; then
+			if [ "${AGENT_INIT}" == "yes" ]; then
+				die "Guest SELinux with the agent init is not supported yet"
+			fi
+
+			info "Labeling rootfs for SELinux"
+			selinuxfs_path="${mount_dir}${SELINUXFS}"
+			mkdir -p "$selinuxfs_path"
+			if mountpoint $SELINUXFS > /dev/null && \
+				chroot "${mount_dir}" command -v restorecon > /dev/null; then
+				mount -t selinuxfs selinuxfs "$selinuxfs_path"
+				chroot "${mount_dir}" restorecon -RF -e ${SELINUXFS} /
+				umount "${selinuxfs_path}"
+			else
+				die "Could not label the rootfs. Make sure that SELinux is enabled on the host \
+  and the rootfs is built with SELINUX=yes"
+			fi
+		fi
+}
+
+setup_systemd() {
+		info "Creating empty machine-id to allow systemd to bind-mount it"
+		touch "${mount_dir}/etc/machine-id"
 }
 
 create_rootfs_image() {
@@ -378,6 +441,7 @@ create_rootfs_image() {
 	local img_size="$3"
 	local fs_type="$4"
 	local block_size="$5"
+	local agent_bin="$6"
 
 	create_disk "${image}" "${img_size}" "${fs_type}" "${rootfs_start}"
 
@@ -385,35 +449,26 @@ create_rootfs_image() {
 		die "Could not setup loop device"
 	fi
 
-	if ! format_loop "${device}" "${block_size}" "${fs_type}"; then
+	if ! format_loop "${device}" "${block_size}" "${fs_type}" ""; then
 		die "Could not format loop device: ${device}"
 	fi
 
 	info "Mounting root partition"
-	readonly mount_dir=$(mktemp -p ${TMPDIR:-/tmp} -d osbuilder-mount-dir.XXXX)
+	local mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
 	mount "${device}p1" "${mount_dir}"
 	OK "root partition mounted"
 
 	info "Copying content from rootfs to root partition"
 	cp -a "${rootfs}"/* "${mount_dir}"
+
+	info "Setup SELinux"
+	setup_selinux "${mount_dir}" "${agent_bin}"
+
 	sync
 	OK "rootfs copied"
 
-	info "Removing unneeded systemd services and sockets"
-	for u in "${systemd_units[@]}"; do
-		find "${mount_dir}" -type f \( \
-			 -name "${u}.service" -o \
-			 -name "${u}.socket" \) \
-			 -exec rm -f {} \;
-	done
-
-	info "Removing unneeded systemd files"
-	for u in "${systemd_files[@]}"; do
-		find "${mount_dir}" -type f -name "${u}" -exec rm -f {} \;
-	done
-
-	info "Creating empty machine-id to allow systemd to bind-mount it"
-	touch "${mount_dir}/etc/machine-id"
+	info "Setup systemd"
+	setup_systemd "${mount_dir}"
 
 	info "Unmounting root partition"
 	umount "${mount_dir}"
@@ -423,8 +478,57 @@ create_rootfs_image() {
 		fsck.ext4 -D -y "${device}p1"
 	fi
 
+	if [ "${MEASURED_ROOTFS}" == "yes" ] && [ -b "${device}p2" ]; then
+		info "veritysetup format rootfs device: ${device}p1, hash device: ${device}p2"
+		local image_dir=$(dirname "${image}")
+		veritysetup format "${device}p1" "${device}p2" > "${image_dir}"/root_hash.txt 2>&1
+	fi
+
 	losetup -d "${device}"
-	rmdir "${mount_dir}"
+	rm -rf "${mount_dir}"
+}
+
+create_erofs_rootfs_image() {
+	local rootfs="$1"
+	local image="$2"
+	local block_size="$3"
+	local agent_bin="$4"
+
+	if [ "$block_size" -ne 4096 ]; then
+		die "Invalid block size for erofs"
+	fi
+
+	if ! device="$(setup_loop_device "${image}")"; then
+		die "Could not setup loop device"
+	fi
+
+	local mount_dir=$(mktemp -p "${TMPDIR:-/tmp}" -d osbuilder-mount-dir.XXXX)
+
+	info "Copying content from rootfs to root partition"
+	cp -a "${rootfs}"/* "${mount_dir}"
+
+	info "Setup SELinux"
+	setup_selinux "${mount_dir}" "${agent_bin}"
+
+	sync
+	OK "rootfs copied"
+
+	info "Setup systemd"
+	setup_systemd "${mount_dir}"
+
+	readonly fsimage="$(mktemp)"
+	mkfs.erofs -Enoinline_data "${fsimage}" "${mount_dir}"
+	local img_size="$(stat -c"%s" "${fsimage}")"
+	local img_size_mb="$(((("${img_size}" + 1048576) / 1048576) + 1 + "${rootfs_start}"))"
+
+	create_disk "${image}" "${img_size_mb}" "ext4" "${rootfs_start}"
+
+	dd if="${fsimage}" of="${device}p1"
+
+	losetup -d "${device}"
+	rm -rf "${mount_dir}"
+
+	return "${img_size_mb}"
 }
 
 set_dax_header() {
@@ -467,8 +571,6 @@ set_dax_header() {
 }
 
 main() {
-	[ "$(id -u)" -eq 0 ] || die "$0: must be run as root"
-
 	# variables that can be overwritten by environment variables
 	local agent_bin="${AGENT_BIN:-kata-agent}"
 	local agent_init="${AGENT_INIT:-no}"
@@ -516,16 +618,27 @@ main() {
 		die "Invalid rootfs"
 	fi
 
-	img_size=$(calculate_img_size "${rootfs}" "${root_free_space}" "${fs_type}" "${block_size}")
+	if [ "${fs_type}" == 'erofs' ]; then
+		# mkfs.erofs accepts an src root dir directory as an input
+		# rather than some device, so no need to guess the device dest size first.
+		create_erofs_rootfs_image "${rootfs}" "${image}" \
+						"${block_size}" "${agent_bin}"
+		rootfs_img_size=$?
+		img_size=$((rootfs_img_size + dax_header_sz))
+	else
+		img_size=$(calculate_img_size "${rootfs}" "${root_free_space}" \
+			"${fs_type}" "${block_size}")
 
-	# the first 2M are for the first MBR + NVDIMM metadata and were already
-	# consider in calculate_img_size
-	rootfs_img_size=$((img_size - dax_header_sz))
-	create_rootfs_image "${rootfs}" "${image}" "${rootfs_img_size}" \
-						"${fs_type}" "${block_size}"
-
+		# the first 2M are for the first MBR + NVDIMM metadata and were already
+		# consider in calculate_img_size
+		rootfs_img_size=$((img_size - dax_header_sz))
+		create_rootfs_image "${rootfs}" "${image}" "${rootfs_img_size}" \
+						"${fs_type}" "${block_size}" "${agent_bin}"
+	fi
 	# insert at the beginning of the image the MBR + DAX header
 	set_dax_header "${image}" "${img_size}" "${fs_type}" "${nsdax_bin}"
+
+	chown "${USER}:${GROUP}" "${image}"
 }
 
 main "$@"

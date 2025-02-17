@@ -9,14 +9,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"testing"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/sirupsen/logrus"
@@ -31,7 +28,6 @@ const testHypervisor = "hypervisor"
 const testJailer = "jailer"
 const testFirmware = "firmware"
 const testVirtiofsd = "virtiofsd"
-const testHypervisorCtl = "hypervisorctl"
 const testBundle = "bundle"
 
 const testDisabledAsNonRoot = "Test disabled as requires root privileges"
@@ -45,44 +41,21 @@ var testQemuImagePath = ""
 var testQemuPath = ""
 var testClhKernelPath = ""
 var testClhImagePath = ""
+var testClhInitrdPath = ""
 var testClhPath = ""
-var testAcrnKernelPath = ""
-var testAcrnImagePath = ""
-var testAcrnPath = ""
-var testAcrnCtlPath = ""
+var testStratovirtKernelPath = ""
+var testStratovirtImagePath = ""
+var testStratovirtInitrdPath = ""
+var testStratovirtPath = ""
 var testVirtiofsdPath = ""
 
 var testHyperstartCtlSocket = ""
 var testHyperstartTtySocket = ""
 
-// cleanUp Removes any stale sandbox/container state that can affect
-// the next test to run.
-func cleanUp() {
-	os.RemoveAll(fs.MockRunStoragePath())
-	os.RemoveAll(fs.MockRunVMStoragePath())
-	syscall.Unmount(getSharePath(testSandboxID), syscall.MNT_DETACH|UmountNoFollow)
-	os.RemoveAll(testDir)
-	os.MkdirAll(testDir, DirMode)
-
-	setup()
-}
-
 func setup() {
 	os.Mkdir(filepath.Join(testDir, testBundle), DirMode)
 
 	for _, filename := range []string{testQemuKernelPath, testQemuInitrdPath, testQemuImagePath, testQemuPath} {
-		_, err := os.Create(filename)
-		if err != nil {
-			fmt.Printf("Could not recreate %s:%v", filename, err)
-			os.Exit(1)
-		}
-	}
-}
-
-func setupAcrn() {
-	os.Mkdir(filepath.Join(testDir, testBundle), DirMode)
-
-	for _, filename := range []string{testAcrnKernelPath, testAcrnImagePath, testAcrnPath, testAcrnCtlPath} {
 		_, err := os.Create(filename)
 		if err != nil {
 			fmt.Printf("Could not recreate %s:%v", filename, err)
@@ -103,12 +76,22 @@ func setupClh() {
 	}
 }
 
+func setupStratovirt() {
+	os.Mkdir(filepath.Join(testDir, testBundle), DirMode)
+
+	for _, filename := range []string{testStratovirtKernelPath, testStratovirtInitrdPath, testStratovirtPath, testVirtiofsdPath} {
+		_, err := os.Create(filename)
+		if err != nil {
+			fmt.Printf("Could not recreate %s:%v", filename, err)
+			os.Exit(1)
+		}
+	}
+}
+
 // TestMain is the common main function used by ALL the test functions
 // for this package.
 func TestMain(m *testing.M) {
 	var err error
-
-	persist.EnableMockTesting()
 
 	flag.Parse()
 
@@ -121,10 +104,12 @@ func TestMain(m *testing.M) {
 	}
 	SetLogger(context.Background(), logger)
 
-	testDir, err = ioutil.TempDir("", "vc-tmp-")
+	testDir, err = os.MkdirTemp("", "vc-tmp-")
 	if err != nil {
 		panic(err)
 	}
+
+	fs.EnableMockTesting(filepath.Join(testDir, "mockfs"))
 
 	fmt.Printf("INFO: Creating virtcontainers test directory %s\n", testDir)
 	err = os.MkdirAll(testDir, DirMode)
@@ -134,7 +119,7 @@ func TestMain(m *testing.M) {
 	}
 
 	utils.StartCmd = func(c *exec.Cmd) error {
-		//startSandbox will check if the hypervisor is alive and
+		//StartVM will Check if the hypervisor is alive and
 		// checks for the PID is running, lets fake it using our
 		// own PID
 		c.Process = &os.Process{Pid: os.Getpid()}
@@ -148,19 +133,20 @@ func TestMain(m *testing.M) {
 
 	setup()
 
-	testAcrnKernelPath = filepath.Join(testDir, testKernel)
-	testAcrnImagePath = filepath.Join(testDir, testImage)
-	testAcrnPath = filepath.Join(testDir, testHypervisor)
-	testAcrnCtlPath = filepath.Join(testDir, testHypervisorCtl)
-
-	setupAcrn()
-
 	testVirtiofsdPath = filepath.Join(testDir, testBundle, testVirtiofsd)
 	testClhKernelPath = filepath.Join(testDir, testBundle, testKernel)
 	testClhImagePath = filepath.Join(testDir, testBundle, testImage)
+	testClhInitrdPath = filepath.Join(testDir, testBundle, testInitrd)
 	testClhPath = filepath.Join(testDir, testBundle, testHypervisor)
 
 	setupClh()
+
+	testStratovirtKernelPath = filepath.Join(testDir, testBundle, testKernel)
+	testStratovirtImagePath = filepath.Join(testDir, testBundle, testInitrd)
+	testStratovirtInitrdPath = filepath.Join(testDir, testBundle, testInitrd)
+	testStratovirtPath = filepath.Join(testDir, testBundle, testHypervisor)
+
+	setupStratovirt()
 
 	// set now that configStoragePath has been overridden.
 	sandboxDirState = filepath.Join(fs.MockRunStoragePath(), testSandboxID)

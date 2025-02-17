@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright (c) 2018 Intel Corporation
 #
@@ -72,7 +72,7 @@ die() {
 
 # Display usage to stdout.
 usage() {
-	cat <<EOT
+	cat <<EOF
 Overview:
 
 	Display configure options required to build the specified
@@ -94,7 +94,7 @@ Example:
 
 	$ $script_name qemu
 
-EOT
+EOF
 }
 
 show_tags_header() {
@@ -102,10 +102,10 @@ show_tags_header() {
 	local key
 	local value
 
-	cat <<EOT
+	cat <<EOF
 # Recognised option tags:
 #
-EOT
+EOF
 
 	# sort the tags
 	keys=${!recognised_tags[@]}
@@ -222,14 +222,6 @@ generate_qemu_options() {
 
 	# Disabled options
 
-	# Disable sheepdog block driver support (deprecated in 5.2.0)
-	if ! gt_eq ${qemu_version} 5.2.0 ; then
-		qemu_options+=(size:--disable-sheepdog)
-	fi
-
-	# Disable block migration in the main migration stream
-	qemu_options+=(size:--disable-live-block-migration)
-
 	# braille support not required
 	qemu_options+=(size:--disable-brlapi)
 
@@ -247,7 +239,12 @@ generate_qemu_options() {
 	# Disable graphical network access
 	qemu_options+=(size:--disable-vnc)
 	qemu_options+=(size:--disable-vnc-jpeg)
-	qemu_options+=(size:--disable-vnc-png)
+	if ! gt_eq "${qemu_version}" "7.0.50" ; then
+		qemu_options+=(size:--disable-vnc-png)
+	else
+		qemu_options+=(size:--disable-png)
+	fi
+
 	qemu_options+=(size:--disable-vnc-sasl)
 
 	# Disable PAM authentication: it's a feature used together with VNC access
@@ -255,7 +252,6 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-auth-pam)
 
 	# Disable unused filesystem support
-	[ "$arch" == x86_64 ] && qemu_options+=(size:--disable-fdt)
 	qemu_options+=(size:--disable-glusterfs)
 	qemu_options+=(size:--disable-libiscsi)
 	qemu_options+=(size:--disable-libnfs)
@@ -268,9 +264,6 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-lzo)
 	qemu_options+=(size:--disable-snappy)
 
-	# Disable unused security options
-	qemu_options+=(security:--disable-tpm)
-
 	# Disable userspace network access ("-net user")
 	qemu_options+=(size:--disable-slirp)
 
@@ -282,7 +275,7 @@ generate_qemu_options() {
 	case "$arch" in
 	aarch64) ;;
 	x86_64) qemu_options+=(size:--disable-tcg) ;;
-	ppc64le) ;;
+	ppc64le) qemu_options+=(size:--disable-tcg) ;;
 	s390x) qemu_options+=(size:--disable-tcg) ;;
 	esac
 
@@ -308,7 +301,10 @@ generate_qemu_options() {
 		;;
 	esac
 	qemu_options+=(size:--disable-qom-cast-debug)
-	qemu_options+=(size:--disable-tcmalloc)
+
+	# Disable libudev since it is only needed for qemu-pr-helper and USB,
+	# none of which are used with Kata
+	qemu_options+=(size:--disable-libudev)
 
 	# Disallow network downloads
 	qemu_options+=(security:--disable-curl)
@@ -325,10 +321,17 @@ generate_qemu_options() {
 	# But since QEMU 5.2 the daemon is built as part of the tools set
 	# (disabled with --disable-tools) thus it needs to be explicitely
 	# enabled.
-	if gt_eq "${qemu_version}" "5.2.0" ; then
-		qemu_options+=(functionality:--enable-virtiofsd)
-		qemu_options+=(functionality:--enable-virtfs)
-	fi
+	#
+	# From Kata Containers 2.5.0-alpha2 all arches but powerpc have been
+	# using the new implementation of virtiofs daemon, which is not part
+	# of QEMU.
+	#
+	# qemu configure does not support virtiofsd if qemu version >= 8.0.0.
+        if ! gt_eq "${qemu_version}" "8.0.0" ; then
+		qemu_options+=(functionality:--disable-virtiofsd)
+        fi
+
+	qemu_options+=(functionality:--enable-virtfs)
 
 	# Don't build linux-user bsd-user
 	qemu_options+=(size:--disable-bsd-user)
@@ -341,17 +344,14 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-vde)
 
 	# Don't build other options which can't be depent on build server.
-	qemu_options+=(size:--disable-xfsctl)
-	qemu_options+=(size:--disable-libxml2)
+	if ! gt_eq "${qemu_version}" "7.0.50" ; then
+		qemu_options+=(size:--disable-xfsctl)
+		qemu_options+=(size:--disable-libxml2)
+	fi
 	qemu_options+=(size:--disable-nettle)
 
 	# Disable XEN driver
 	qemu_options+=(size:--disable-xen)
-
-	# FIXME: why is this disabled?
-	# (for reference, it's explicitly enabled in Ubuntu 17.10 and
-	# implicitly enabled in Fedora 27).
-	qemu_options+=(size:--disable-linux-aio)
 
 	# Disable Capstone
 	qemu_options+=(size:--disable-capstone)
@@ -379,10 +379,43 @@ generate_qemu_options() {
 	qemu_options+=(size:--disable-dmg)
 	qemu_options+=(size:--disable-parallels)
 
-	# vxhs was deprecated on QEMU 5.1 so it doesn't need to be
-	# explicitly disabled.
-	if ! gt_eq "${qemu_version}" "5.1.0" ; then
-	    qemu_options+=(size:--disable-vxhs)
+	# Disable new available features from 8.2.4
+	qemu_options+=(size:--disable-colo-proxy)
+	qemu_options+=(size:--disable-debug-graph-lock)
+	qemu_options+=(size:--disable-hexagon-idef-parser)
+	qemu_options+=(size:--disable-libdw)
+	qemu_options+=(size:--disable-pipewire)
+	qemu_options+=(size:--disable-pixman)
+	qemu_options+=(size:--disable-relocatable)
+	qemu_options+=(size:--disable-rutabaga-gfx)
+	qemu_options+=(size:--disable-vmdk)
+	qemu_options+=(size:--disable-avx512bw)
+	qemu_options+=(size:--disable-vpc)
+	qemu_options+=(size:--disable-vhdx)
+	qemu_options+=(size:--disable-hv-balloon)
+
+	# Disable various features based on the qemu_version
+	if gt_eq "${qemu_version}" "9.1.0" ; then
+		# Disable Query Processing Library support
+		qemu_options+=(size:--disable-qpl)
+		# Disable UADK Library support
+		qemu_options+=(size:--disable-uadk)
+		# Disable syscall buffer debugging support
+		qemu_options+=(size:--disable-debug-remap)
+
+	fi
+
+	# Disable gio support
+	qemu_options+=(size:--disable-gio)
+	# Disable libdaxctl part of ndctl support
+	qemu_options+=(size:--disable-libdaxctl)
+	qemu_options+=(size:--disable-oss)
+
+	# Building static binaries for aarch64 requires disabling PIE
+	# We get an GOT overflow and the OS libraries are only build with fpic
+	# and not with fPIC which enables unlimited sized GOT tables.
+	if [ "${static}" == "true" ] && [ "${arch}" == "aarch64" ]; then
+		qemu_options+=(arch:"--disable-pie")
 	fi
 
 	#---------------------------------------------------------------------
@@ -394,6 +427,10 @@ generate_qemu_options() {
 
 	# Required for fast network access
 	qemu_options+=(speed:--enable-vhost-net)
+
+	# Support Linux AIO (native)
+	qemu_options+=(size:--enable-linux-aio)
+	qemu_options+=(size:--enable-linux-io-uring)
 
 	# Support Ceph RADOS Block Device (RBD)
 	[ -z "${static}" ] && qemu_options+=(functionality:--enable-rbd)
@@ -411,16 +448,15 @@ generate_qemu_options() {
 	# AVX2 is enabled by default by x86_64, make sure it's enabled only
 	# for that architecture
 	if [ "$arch" == x86_64 ]; then
-	    qemu_options+=(speed:--enable-avx2)
-	    qemu_options+=(speed:--enable-avx512f)
-	    # According to QEMU's nvdimm documentation: When 'pmem' is 'on' and QEMU is
-	    # built with libpmem support, QEMU will take necessary operations to guarantee
-	    # the persistence of its own writes to the vNVDIMM backend.
-	    qemu_options+=(functionality:--enable-libpmem)
+		qemu_options+=(speed:--enable-avx2)
+		qemu_options+=(speed:--enable-avx512bw)
 	else
-	    qemu_options+=(speed:--disable-avx2)
-	    qemu_options+=(functionality:--disable-libpmem)
+		qemu_options+=(speed:--disable-avx2)
 	fi
+	# We're disabling pmem support, it is heavilly broken with
+	# Ubuntu's static build of QEMU
+	qemu_options+=(functionality:--disable-libpmem)
+
 	# Enable libc malloc_trim() for memory optimization.
 	qemu_options+=(speed:--enable-malloc-trim)
 
@@ -434,20 +470,16 @@ generate_qemu_options() {
 		qemu_options+=(arch:"--target-list=${arch}-softmmu")
 	fi
 
-	# aarch64 need to explictly set --enable-pie
-	if [ -z "${static}" ] && [ "${arch}" = "aarch64" ]; then
-		qemu_options+=(arch:"--enable-pie")
-	fi
+	# SECURITY: Create binary as a Position Independant Executable,
+	# and take advantage of ASLR, making ROP attacks much harder to perform.
+	# (https://wiki.debian.org/Hardening)
+	[ -z "${static}" ] && qemu_options+=(arch:"--enable-pie")
 
 	_qemu_cflags=""
 
 	# compile with high level of optimisation
 	# On version 5.2.0 onward the Meson build system warns to not use -O3
-	if ! gt_eq "${qemu_version}" "5.2.0" ; then
-		_qemu_cflags+=" -O3"
-	else
-		_qemu_cflags+=" -O2"
-	fi
+	_qemu_cflags+=" -O2"
 
 	# Improve code quality by assuming identical semantics for interposed
 	# synmbols.
@@ -463,32 +495,12 @@ generate_qemu_options() {
 	# (such as argument and buffer overflows checks).
 	_qemu_cflags+=" -D_FORTIFY_SOURCE=2"
 
-	# SECURITY: Create binary as a Position Independant Executable,
-	# and take advantage of ASLR, making ROP attacks much harder to perform.
-	# (https://wiki.debian.org/Hardening)
-	case "$arch" in
-	aarch64) _qemu_cflags+=" -fPIE" ;;
-	x86_64) _qemu_cflags+=" -fPIE" ;;
-	ppc64le) _qemu_cflags+=" -fPIE" ;;
-	s390x) _qemu_cflags+=" -fPIE" ;;
-	esac
-
 	# Set compile options
 	qemu_options+=(functionality,security,speed,size:"--extra-cflags=\"${_qemu_cflags}\"")
 
 	unset _qemu_cflags
 
 	_qemu_ldflags=""
-
-	# SECURITY: Link binary as a Position Independant Executable,
-	# and take advantage of ASLR, making ROP attacks much harder to perform.
-	# (https://wiki.debian.org/Hardening)
-	case "$arch" in
-	aarch64) [ -z "${static}" ] && _qemu_ldflags+=" -pie" ;;
-	x86_64) [ -z "${static}" ] && _qemu_ldflags+=" -pie" ;;
-	ppc64le) [ -z "${static}" ] && _qemu_ldflags+=" -pie" ;;
-	s390x) [ -z "${static}" ] && _qemu_ldflags+=" -pie" ;;
-	esac
 
 	# SECURITY: Disallow executing code on the stack.
 	_qemu_ldflags+=" -z noexecstack"
@@ -558,8 +570,8 @@ main() {
 	[ -n "${qemu_version}" ] ||
 		die "cannot determine qemu version from file $qemu_version_file"
 
-	if ! gt_eq "${qemu_version}" "5.0.0" ; then
-	    die "Kata requires QEMU >= 5.0.0"
+	if ! gt_eq "${qemu_version}" "6.1.0" ; then
+		die "Kata requires QEMU >= 6.1.0"
 	fi
 
 	local gcc_version_major=$(gcc -dumpversion | cut -f1 -d.)

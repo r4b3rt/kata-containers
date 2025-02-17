@@ -24,7 +24,7 @@ async fn handle_sigchild(logger: Logger, sandbox: Arc<Mutex<Sandbox>>) -> Result
     loop {
         // Avoid reaping the undesirable child's signal, e.g., execute_hook's
         // The lock should be released immediately.
-        rustjail::container::WAIT_PID_LOCKER.lock().await;
+        let _locker = rustjail::container::WAIT_PID_LOCKER.lock().await;
         let result = wait::waitpid(
             Some(Pid::from_raw(-1)),
             Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WALL),
@@ -57,17 +57,21 @@ async fn handle_sigchild(logger: Logger, sandbox: Arc<Mutex<Sandbox>>) -> Result
                 continue;
             }
 
-            let mut p = process.unwrap();
-            let ret: i32;
+            let p = process.unwrap();
 
-            match wait_status {
-                WaitStatus::Exited(_, c) => ret = c,
-                WaitStatus::Signaled(_, sig, _) => ret = sig as i32,
+            let ret: i32 = match wait_status {
+                WaitStatus::Exited(_, c) => c,
+                WaitStatus::Signaled(_, sig, _) => sig as i32,
                 _ => {
                     info!(logger, "got wrong status for process";
                                   "child-status" => format!("{:?}", wait_status));
                     continue;
                 }
+            };
+
+            // In passfd io mode, we need to wait for the copy task end.
+            if let Some(proc_io) = &mut p.proc_io {
+                proc_io.wg_output.wait().await;
             }
 
             p.exit_code = ret;
@@ -140,15 +144,12 @@ mod tests {
 
         tx.send(true).expect("failed to request shutdown");
 
-        loop {
-            select! {
-                _ = handle => {
-                    println!("INFO: task completed");
-                    break;
-                },
-                _ = &mut timeout => {
-                    panic!("signal thread failed to stop");
-                }
+        select! {
+            _ = handle => {
+                println!("INFO: task completed");
+            },
+            _ = &mut timeout => {
+                panic!("signal thread failed to stop");
             }
         }
     }

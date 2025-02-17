@@ -14,9 +14,6 @@ period of time, once a stable release for Kata Containers 2.x is published,
 Kata Containers 1.x stable users should consider switching to the Kata 2.x
 release.
 
-See the [stable branch strategy documentation](Stable-Branch-Strategy.md) for
-further details.
-
 # Determine current version
 
 To display the current Kata Containers version, run one of the following:
@@ -102,7 +99,7 @@ first
 [install the latest release](#determine-latest-version).
 
 See the
-[manual installation installation documentation](install/README.md#manual-installation)
+[manual installation documentation](install/README.md#manual-installation)
 for details on how to automatically install and configuration a static release
 with containerd.
 
@@ -114,7 +111,7 @@ with containerd.
 > kernel or image.
 
 If you are using custom
-[guest assets](design/architecture.md#guest-assets),
+[guest assets](design/architecture/README.md#guest-assets),
 you must upgrade them to work with Kata Containers 2.x since Kata
 Containers 1.x assets will **not** work.
 
